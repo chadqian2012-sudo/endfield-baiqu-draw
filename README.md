@@ -17,7 +17,7 @@ EXE 使用相同命令，例如 `AKE.exe math`。它是命令行程序，双击�
 
 ## 校准与素材
 
-先把游戏放在前台，运行 `python ake.py calibrate`。依次选择五个牌面数字区域、五个库存数值区域、轮次、三个按钮，以及手牌页和放弃弹窗的独特锚点区域。按 Enter 接受，Esc 取消。未显示的弹窗需从实际截图核对区域后，通过 `--layout` 导入准确布局；不要猜测坐标。默认生成 `calibration.local.json`，绑定本次游戏进程、客户区和 DPI。窗口移动、缩放或客户端重启后重新校准。
+在终端运行 `python ake.py calibrate`，看到切换提示后在 10 秒内切回游戏。依次选择五个牌面数字区域、五个库存数值区域、轮次、三个按钮，以及手牌页和放弃弹窗的独特锚点区域。按 Enter 接受，Esc 取消。未显示的弹窗需从实际截图核对区域后，通过 `--layout` 导入准确布局；不要猜测坐标。默认生成 `calibration.local.json`，绑定本次游戏进程、客户区和 DPI。窗口移动、缩放或客户端重启后重新校准。
 
 布局 JSON 包含 `frame_size: [宽,高]`、`regions`、`groups` 和 `anchors`。`regions.slots` 与 `regions.inventory` 各为五个 `[x,y,宽,高]`；其余区域名为 `round`、`draw`、`abandon`、`confirm`、`hand` 和 `abandon_dialog`。所有坐标相对客户区。可运行 `calibrate --layout 布局.json --output calibration.local.json` 绑定现有布局，不会发送游戏输入。
 
@@ -27,7 +27,7 @@ EXE 使用相同命令，例如 `AKE.exe math`。它是命令行程序，双击�
 python ake.py sample --profile calibration.local.json --group cards --label 5 --index 0 --batch session-A --score 0.95 --margin 0.1
 ```
 
-上述阈值仅演示参数格式，必须用标注集校准。`index` 从 0 开始。也可传 `--image 原始截图.png`，或 `--recording 录制目录 --at 秒数`，画面尺寸必须与布局相同。库存用独立的 `stock` 组，`--digit` 选择分割出的字符；不会从手牌推算库存。模板写入被 Git 忽略的本地 `logs/calibration-assets`。
+上述阈值仅演示参数格式，必须用标注集校准。`index` 从 0 开始。直接从游戏采样时也会等待最多 10 秒供你切回游戏，不会主动抢焦点。也可传 `--image 原始截图.png`，或 `--recording 录制目录 --at 秒数`，画面尺寸必须与布局相同。库存用独立的 `stock` 组，`--digit` 选择分割出的字符；不会从手牌推算库存。模板写入被 Git 忽略的本地 `logs/calibration-assets`。
 
 必要类别：`cards` 为 `empty,1,2,3,4,5`；`stock` 为字符 `0`–`9`；`round` 为 `1,2`；`draw/abandon/confirm` 为 `enabled,disabled`。锚点使用组名 `hand` 或 `abandon_dialog`，不需要 label。每次 sample 都需要明确 batch、score 和 margin。分类分数不是正确概率。区域和图像形状不匹配或类别不完整时返回未知。
 
@@ -53,7 +53,7 @@ python ake.py run --live --profile calibration.local.json --qualification logs/q
 
 ## 日志、限制与打包
 
-事件日志为 `logs/events.jsonl`，每卷 2 MB、最多 3 个备份。成功/错误证据只保存配置的牌槽和库存区域，位于 `logs/evidence`。录屏可能包含其他软件的浮窗；原始录像、模板、日志和校准文件都不上传。证据文件单独保留，需要用户定期归档。
+事件日志为 `logs/events.jsonl`，每条含本地带时区时间 `time` 和单调时钟 `monotonic`，每卷 2 MB、最多 3 个备份。成功/错误证据只保存配置的牌槽和库存区域，位于 `logs/evidence`。录屏可能包含其他软件的浮窗；原始录像、模板、日志和校准文件都不上传。证据文件单独保留，需要用户定期归档。
 
 缺模板、库存不一致、窗口身份变化和验证失败均应先检查素材和校准，不应提高点击频率。首次接管非空手牌只读提示，用户手动返回空牌面后再启动。当前缺少完整库存字符、第二轮及独立实机验收素材，尚不能宣称当前电脑可可靠自动运行。
 

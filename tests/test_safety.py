@@ -3,12 +3,27 @@ from unittest.mock import Mock, patch
 from ake import drive
 from ake_core import Observation
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, draw_completed, stable
+from windowing import WindowIdentity, click
 
 EMPTY = Observation((0,0,0,0,0),(6,6,6,6,10),1)
 FIVE = Observation((5,0,0,0,0),(6,6,6,6,9),1)
 STALE_STOCK = Observation((5,0,0,0,0),(6,6,6,6,10),1)
 
 class SafetyTests(unittest.TestCase):
+    def test_input_is_rejected_when_focus_changes_during_identity_check(self):
+        binding = WindowIdentity(1,10,20,'game.exe',(0,0,100,100),96)
+        foreground = [binding.hwnd]
+        api = Mock()
+        api.GetSystemMetrics.side_effect = {76:0,77:0,78:100,79:100}.__getitem__
+        api.GetForegroundWindow.side_effect = lambda:foreground[0]
+        api.SendInput.return_value = 3
+        def switched_window(hwnd):
+            foreground[0] = 2
+            return binding
+        with patch('windowing._api',return_value=(api,None)), patch('windowing.snapshot',side_effect=switched_window):
+            self.assertFalse(click(binding,[10,10,10,10],lambda:True))
+        api.SendInput.assert_not_called()
+
     def run_stream(self, observations, mode='live', stop_after_click=False,
                    stop_at_submission=False, step=.12, save=None, pause_at=None):
         class Profile:

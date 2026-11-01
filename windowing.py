@@ -85,7 +85,7 @@ def find_unique(title='Endfield'):
 
 def foreground_matches(binding):
     u,_ = _api()
-    return u.GetForegroundWindow() == binding.hwnd and snapshot(binding.hwnd) == binding
+    return snapshot(binding.hwnd) == binding and u.GetForegroundWindow() == binding.hwnd
 
 class Hotkeys:
     """Thread-owned F8/F9 registrations. Construction must precede live input."""

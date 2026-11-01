@@ -12,6 +12,25 @@ from ake_core import Observation
 from vision import VisionProfile, classify, recognize_card, segment_digits, normalize_digit, recognize_stock, read_image, write_image
 
 class VisionTests(unittest.TestCase):
+    def test_uninformative_sample_preserves_existing_profile(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_image(root/'old.png',np.arange(64,dtype=np.uint8).reshape(8,8))
+            config = {'frame_size':[8,8],'regions':{'hand':[0,0,8,8],'slots':[[0,0,8,8]]*5},
+                      'anchors':{'hand':{'region':[0,0,8,8],'template':'old.png','threshold':.95}},
+                      'groups':{'cards':{'templates':{'5':['old.png']},'thresholds':{'5':.95},'margin':.1}}}
+            path = root/'profile.json'
+            path.write_text(json.dumps(config),encoding='utf-8')
+            original = path.read_bytes()
+            for group,label in [('hand',None),('cards','5')]:
+                with self.subTest(group=group):
+                    profile = VisionProfile(path)
+                    with self.assertRaisesRegex(ValueError,'visual detail'):
+                        profile.add_sample(np.full((8,8),235,dtype=np.uint8),group,label,0,0,.95,.1,'new-batch')
+                    self.assertEqual(path.read_bytes(),original)
+                    self.assertFalse((root/'logs').exists())
+                    self.assertEqual(profile.config,config)
+
     def test_live_rejects_old_report_before_initializing_windows_input(self):
         profile = Mock()
         profile.issues.return_value = []
@@ -91,6 +110,7 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(classify(a, templates, {'a':.99,'b':.99}, .1).label,'a')
         self.assertIsNone(classify(a, {'a':[a]}, {'a':.9}, .1).label)
         self.assertIsNone(classify(a, {'a':[a],'b':[a]}, {'a':.9,'b':.9}, .1).label)
+        self.assertIsNone(classify(a, {'a':[a],'b':[a]}, {'a':.9,'b':.9}, 0).label)
         self.assertIsNone(classify(a, templates, {}, .1).label)
         self.assertIsNone(classify(np.zeros((32,32),dtype=np.uint8), templates, {'a':.9,'b':.9}, .1).label)
         self.assertIsNone(recognize_card(a, {'1':[a],'5':[b]}, {'1':.9,'5':.9}, .1).label)
