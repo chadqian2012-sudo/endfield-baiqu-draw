@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from collections import deque
 from enum import Enum
+import time
 from ake_core import INITIAL, Observation, Decision, decide
 
 class Action(Enum):
@@ -68,13 +69,20 @@ class ObservationStabilizer:
 
 class ActionTracker:
     """Tracks at most one sent action; pause never forgets an unconfirmed action."""
-    def __init__(self):
+    def __init__(self, timeout=10.0, clock=time.monotonic):
+        if timeout <= 0:
+            raise ValueError('timeout must be positive')
         self.pending = None
         self.paused = True
         self.terminated = False
         self._next_id = 1
         self.phase = 'hand'
         self.candidate = False
+        self.timeout = timeout
+        self.clock = clock
+        self.wait_started = None
+        self.wait_elapsed = 0.0
+        self.error = None
 
     def resume(self):
         if self.terminated or self.pending is not None or self.candidate:
@@ -83,19 +91,21 @@ class ActionTracker:
         return True
 
     def pause(self):
+        if not self.paused and self.pending is not None and self.wait_started is not None:
+            self.wait_elapsed += max(0.0, self.clock() - self.wait_started)
+            self.wait_started = None
         self.paused = True
 
     def stop(self):
-        self.paused = True
+        self.pause()
         self.terminated = True
 
     def observe(self, obs):
         # A possible fourth five freezes actions even before inventory settles.
         if len(obs.slots) == 5 and obs.slots.count(5) >= 4:
             self.candidate = True
-            self.paused = True
             if valid(obs):
-                self.terminated = True
+                self.stop()
 
     def sent(self, action, before, *, early_restart=False):
         if self.paused or self.terminated or self.candidate or self.pending is not None or not valid(before):
@@ -113,7 +123,18 @@ class ActionTracker:
         action_id = self._next_id
         self._next_id += 1
         self.pending = (action_id, action, before)
+        self.wait_started = self.clock()
+        self.wait_elapsed = 0.0
         return action_id
+
+    def check_timeout(self):
+        if self.pending is None or self.paused or self.wait_started is None:
+            return False
+        if self.wait_elapsed + max(0.0, self.clock() - self.wait_started) < self.timeout:
+            return False
+        self.pause()
+        self.error = 'action confirmation timed out'
+        return True
 
     def reconcile(self, after, *, expected_abandon_dialog=False):
         if self.pending is None or self.terminated:
@@ -125,6 +146,9 @@ class ActionTracker:
                     (action == Action.CONFIRM and initial(after)))
         if complete:
             self.pending = None
+            self.wait_started = None
+            self.wait_elapsed = 0.0
+            self.error = None
             if action == Action.ABANDON:
                 self.phase = 'dialog'
             elif action == Action.CONFIRM:

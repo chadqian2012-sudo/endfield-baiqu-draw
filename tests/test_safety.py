@@ -75,4 +75,20 @@ class SafetyTests(unittest.TestCase):
         t.observe(Observation((5,5,5,5,0),(6,6,6,6,6),1))
         self.assertTrue(t.terminated)
 
+    def test_timeout_pauses_without_resending_or_forgetting_action(self):
+        now = [0.0]
+        t = ActionTracker(clock=lambda: now[0])
+        t.resume()
+        action_id = t.sent(Action.DRAW, EMPTY)
+        now[0] = 9.9
+        self.assertFalse(t.check_timeout())
+        now[0] = 10.0
+        self.assertTrue(t.check_timeout())
+        self.assertEqual(t.pending[0], action_id)
+        self.assertFalse(t.resume())
+        now[0] = 1000.0
+        self.assertFalse(t.check_timeout())
+        self.assertTrue(t.reconcile(FIVE))
+        self.assertTrue(t.resume())
+
 if __name__ == '__main__': unittest.main()
