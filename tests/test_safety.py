@@ -9,7 +9,8 @@ FIVE = Observation((5,0,0,0,0),(6,6,6,6,9),1)
 STALE_STOCK = Observation((5,0,0,0,0),(6,6,6,6,10),1)
 
 class SafetyTests(unittest.TestCase):
-    def run_stream(self, observations, mode='live', stop_after_click=False):
+    def run_stream(self, observations, mode='live', stop_after_click=False,
+                   stop_at_submission=False, step=.12, save=None, pause_at=None):
         class Profile:
             regions = {'draw':[0,0,1,1],'abandon':[0,0,1,1],'confirm':[0,0,1,1]}
             def read(self, image): return image,{}
@@ -17,25 +18,32 @@ class SafetyTests(unittest.TestCase):
         events,clicks = [],[]
         def frames():
             for i,obs in enumerate(observations):
-                now[0] = i*.12
+                now[0] = i*step
                 yield i,now[0],obs,True
         started = [False]
         stopped = [False]
         def keys():
+            nonlocal pause_at
             if not started[0]:
                 started[0] = True
                 return [0x77]
+            if stop_at_submission and stopped[0]:
+                return [0x78]
             if stop_after_click and clicks and not stopped[0]:
                 stopped[0] = True
                 return [0x78]
+            if pause_at is not None and now[0] >= pause_at:
+                pause_at = None
+                return [0x77]
             return []
         def perform(region, permitted):
-            self.assertTrue(permitted())
+            if stop_at_submission: stopped[0] = True
+            if not permitted(): return False
             clicks.append(region)
             return True
         with patch('ake.time.monotonic',side_effect=lambda:now[0]):
             summary = drive(Profile(),frames(),mode=mode,emit=events.append,
-                            keys=keys if mode=='live' else None,perform=perform)
+                            keys=keys if mode=='live' else None,perform=perform,save=save)
         return events,clicks,summary
 
     def test_full_stream_stops_at_four_fives(self):
@@ -56,11 +64,79 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(summary['cards_confirmed'],0)
         self.assertEqual(sum(e['event']=='recommendation' for e in events),1)
 
+    def test_observe_reports_nonempty_initial_hand_without_taking_over(self):
+        events,clicks,summary = self.run_stream([FIVE]*5,mode='observe')
+        observed = [e for e in events if e['event']=='observation']
+        self.assertEqual(len(observed),1)
+        self.assertEqual(observed[0]['observation']['slots'],FIVE.slots)
+        self.assertEqual(observed[0]['observation']['inventory'],FIVE.inventory)
+        self.assertEqual(clicks,[])
+        self.assertEqual(summary['attempts_confirmed'],0)
+
+    def test_initial_success_candidate_without_pending_has_own_deadline(self):
+        candidate = Observation((5,5,5,5,0),(6,6,6,6,7),1)
+        save = Mock()
+        events,clicks,summary = self.run_stream([candidate]*100,step=.125,save=save)
+        self.assertEqual(summary['termination_reason'],'suspected success; confirmation timeout')
+        self.assertEqual(clicks,[])
+        self.assertEqual(sum(e['event']=='paused' for e in events),1)
+        save.assert_called_once_with(candidate,'suspected success; confirmation timeout')
+
+    def test_unstable_success_candidate_uses_own_deadline_after_sent_draw(self):
+        snapshots = []
+        for k in range(4):
+            snapshots.extend([Observation(tuple([5]*k+[0]*(5-k)),(6,6,6,6,10-k),1,
+                                          buttons=('enabled','enabled',None))]*4)
+        snapshots.extend(Observation((5,5,5,5,0),(6,6,6,6,7+i%2),1) for i in range(100))
+        save = Mock()
+        events,clicks,summary = self.run_stream(snapshots,step=.125,save=save)
+        self.assertEqual(summary['termination_reason'],'suspected success; confirmation timeout')
+        self.assertEqual(len(clicks),4)
+        self.assertEqual(summary['cards_confirmed'],3)
+        self.assertEqual(sum(e['event']=='paused' for e in events),1)
+        self.assertEqual(save.call_args.args[1],'suspected success; confirmation timeout')
+        save.assert_called_once()
+
+    def test_stable_success_on_deadline_takes_priority_over_candidate_timeout(self):
+        candidate = Observation((5,5,5,5,0),(6,6,6,6,7),1)
+        success = Observation(candidate.slots,(6,6,6,6,6),1)
+        save = Mock()
+        events,clicks,summary = self.run_stream([candidate]*78+[success]*3,step=.125,save=save)
+        self.assertEqual(summary['termination_reason'],'success')
+        self.assertEqual(events[-1]['event'],'success')
+        self.assertFalse(any(e['event']=='paused' for e in events))
+        self.assertEqual(clicks,[])
+        save.assert_called_once_with(success,'success')
+
+    def test_f8_pause_freezes_candidate_deadline_with_draw_pending(self):
+        snapshots = []
+        for k in range(4):
+            snapshots.extend([Observation(tuple([5]*k+[0]*(5-k)),(6,6,6,6,10-k),1,
+                                          buttons=('enabled','enabled',None))]*4)
+        snapshots.extend([Observation((5,5,5,5,0),(6,6,6,6,7),1)]*100)
+        save = Mock()
+        events,clicks,summary = self.run_stream(snapshots,step=.125,save=save,pause_at=3)
+        self.assertEqual(summary['termination_reason'],'source ended')
+        self.assertEqual(len(clicks),4)
+        self.assertEqual(summary['cards_confirmed'],3)
+        self.assertEqual([e['reason'] for e in events if e['event']=='paused'],['F8'])
+        self.assertGreater(summary['paused_seconds'],10)
+        save.assert_not_called()
+
     def test_f9_after_sent_click_is_terminal(self):
         obs = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','enabled',None))
         events,clicks,_ = self.run_stream([obs]*30,stop_after_click=True)
         self.assertEqual(len(clicks),1)
         self.assertEqual(events[-1],{'event':'stopped','reason':'F9'})
+
+    def test_f9_at_final_submission_check_does_not_append_pause(self):
+        obs = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','enabled',None))
+        events,clicks,summary = self.run_stream([obs]*8,stop_at_submission=True)
+        self.assertEqual(summary['termination_reason'],'F9')
+        self.assertEqual(events[-1],{'event':'stopped','reason':'F9'})
+        self.assertFalse(any(e['event']=='paused' for e in events))
+        self.assertEqual(summary['paused_seconds'],0)
+        self.assertEqual(clicks,[])
 
     def test_unresponsive_click_pauses_once_and_counts_pause_time(self):
         obs = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','enabled',None))
@@ -79,9 +155,21 @@ class SafetyTests(unittest.TestCase):
         s = ObservationStabilizer()
         candidate = Observation((5,5,5,5,0),(6,6,6,6,7),1)
         self.assertIsNone(s.add(Frame(1,0,candidate), 0))
-        self.assertTrue(s.candidate)
+        self.assertEqual(s.candidate_since,0)
         self.assertIsNone(s.add(Frame(1,.11,candidate), .11))
         self.assertEqual(len(s.frames),0)
+
+    def test_stabilizer_candidate_deadline_excludes_paused_time(self):
+        s = ObservationStabilizer()
+        candidate = Observation((5,5,5,5,0),(6,6,6,6,7),1)
+        s.add(Frame(1,2,candidate),2)
+        s.pause(3)
+        s.pause(50)
+        self.assertFalse(s.candidate_timed_out(100,10))
+        s.resume(100)
+        self.assertEqual(len(s.frames),0)
+        self.assertFalse(s.candidate_timed_out(108.875,10))
+        self.assertTrue(s.candidate_timed_out(109,10))
 
     def test_draw_requires_stock_and_exactly_one_new_card(self):
         self.assertTrue(draw_completed(EMPTY,FIVE))
