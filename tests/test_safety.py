@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from ake import drive
 from ake_core import Observation
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, draw_completed, stable
@@ -62,6 +62,13 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(clicks),1)
         self.assertEqual(events[-1],{'event':'stopped','reason':'F9'})
 
+    def test_unresponsive_click_pauses_once_and_counts_pause_time(self):
+        obs = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','enabled',None))
+        events,clicks,summary = self.run_stream([obs]*170)
+        self.assertEqual(len(clicks),1)
+        self.assertEqual(sum(e['event']=='paused' for e in events),1)
+        self.assertGreater(summary['paused_seconds'],8)
+
     def test_stability_requires_distinct_fresh_frames(self):
         frames = [Frame(1,0,EMPTY), Frame(2,.11,EMPTY), Frame(3,.22,EMPTY)]
         self.assertTrue(stable(frames,.3))
@@ -84,7 +91,7 @@ class SafetyTests(unittest.TestCase):
     def test_pause_preserves_pending_action(self):
         t = ActionTracker()
         self.assertTrue(t.resume())
-        t.sent(Action.DRAW, EMPTY)
+        t.send(Action.DRAW, EMPTY, lambda _: True)
         t.pause()
         self.assertFalse(t.resume())
         self.assertFalse(t.reconcile(EMPTY))
@@ -98,23 +105,23 @@ class SafetyTests(unittest.TestCase):
         t = ActionTracker()
         t.resume()
         with self.assertRaises(RuntimeError):
-            t.sent(Action.CONFIRM, EMPTY)
+            t.send(Action.CONFIRM, EMPTY, lambda _: True)
         with self.assertRaises(RuntimeError):
-            t.sent(Action.ABANDON, EMPTY)
+            t.send(Action.ABANDON, EMPTY, lambda _: True)
         success = Observation((5,5,5,5,0),(6,6,6,6,6),1)
         with self.assertRaises(RuntimeError):
-            t.sent(Action.DRAW, success)
+            t.send(Action.DRAW, success, lambda _: True)
 
     def test_restart_requires_policy_and_matched_dialog(self):
         t = ActionTracker()
         t.resume()
         one_other = Observation((1,0,0,0,0),(5,6,6,6,10),1)
         with self.assertRaises(RuntimeError):
-            t.sent(Action.ABANDON, one_other)
-        t.sent(Action.ABANDON, one_other, early_restart=True)
+            t.send(Action.ABANDON, one_other, lambda _: True)
+        t.send(Action.ABANDON, one_other, lambda _: True, early_restart=True)
         self.assertFalse(t.reconcile(one_other))
         self.assertTrue(t.reconcile(one_other, expected_abandon_dialog=True))
-        t.sent(Action.CONFIRM, one_other)
+        t.send(Action.CONFIRM, one_other, lambda _: True)
         self.assertFalse(t.reconcile(one_other))
         self.assertTrue(t.reconcile(EMPTY))
 
@@ -126,7 +133,7 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(t.terminated)
         self.assertFalse(t.resume())
         with self.assertRaises(RuntimeError):
-            t.sent(Action.DRAW, EMPTY)
+            t.send(Action.DRAW, EMPTY, lambda _: True)
         t.observe(Observation((5,5,5,5,0),(6,6,6,6,6),1))
         self.assertTrue(t.terminated)
 
@@ -134,7 +141,7 @@ class SafetyTests(unittest.TestCase):
         now = [0.0]
         t = ActionTracker(clock=lambda: now[0])
         t.resume()
-        action_id = t.sent(Action.DRAW, EMPTY)
+        action_id = t.send(Action.DRAW, EMPTY, lambda _: True)
         now[0] = 9.9
         self.assertFalse(t.check_timeout())
         now[0] = 10.0
@@ -145,5 +152,23 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(t.check_timeout())
         self.assertTrue(t.reconcile(FIVE))
         self.assertTrue(t.resume())
+
+    def test_submission_is_validated_before_backend_and_uncertainty_is_retained(self):
+        t = ActionTracker()
+        t.resume()
+        submit = Mock(return_value=True)
+        with self.assertRaises(RuntimeError):
+            t.send(Action.CONFIRM, EMPTY, submit)
+        submit.assert_not_called()
+        cancelled = Mock(return_value=False)
+        self.assertIsNone(t.send(Action.DRAW, EMPTY, cancelled))
+        self.assertIsNone(t.pending)
+        failed = Mock(side_effect=OSError('partial submission'))
+        with self.assertRaises(OSError):
+            t.send(Action.DRAW, EMPTY, failed)
+        self.assertIsNotNone(t.pending)
+        with self.assertRaises(RuntimeError):
+            t.send(Action.DRAW, EMPTY, failed)
+        self.assertEqual(failed.call_count,1)
 
 if __name__ == '__main__': unittest.main()
