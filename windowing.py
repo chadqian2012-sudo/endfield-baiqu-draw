@@ -1,4 +1,4 @@
-"""Read-only Windows window discovery and identity checks; no activation or input."""
+"""Windows window identity, hotkeys and the single mouse-input backend."""
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -86,6 +86,71 @@ def find_unique(title='Endfield'):
 def foreground_matches(binding):
     u,_ = _api()
     return u.GetForegroundWindow() == binding.hwnd and snapshot(binding.hwnd) == binding
+
+class Hotkeys:
+    """Thread-owned F8/F9 registrations. Construction must precede live input."""
+    def __init__(self):
+        self.u,_ = _api()
+        self.u.RegisterHotKey.argtypes = [wintypes.HWND,ctypes.c_int,wintypes.UINT,wintypes.UINT]
+        self.u.UnregisterHotKey.argtypes = [wintypes.HWND,ctypes.c_int]
+        self.u.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),wintypes.HWND,wintypes.UINT,wintypes.UINT,wintypes.UINT]
+        self.registered = []
+        for key in (0x77,0x78):
+            if not self.u.RegisterHotKey(None,key,0x4000,key):
+                self.close()
+                raise RuntimeError('F8/F9 hotkey registration failed')
+            self.registered.append(key)
+
+    def poll(self):
+        message = wintypes.MSG()
+        keys = []
+        while self.u.PeekMessageW(ctypes.byref(message),None,0x0312,0x0312,1):
+            keys.append(int(message.wParam))
+        return keys
+
+    def close(self):
+        for key in self.registered:
+            self.u.UnregisterHotKey(None,key)
+        self.registered.clear()
+
+def click(binding, region, permitted):
+    """Send one complete click after the caller's final state/stop check.
+
+    Foreground checking and OS submission are not atomic. A partial submission
+    is an error; only an inserted left-button-down may be followed by release.
+    """
+    u,_ = _api()
+    x,y,w,h = region
+    if min(x,y) < 0 or min(w,h) <= 0 or x+w > binding.client[2] or y+h > binding.client[3]:
+        raise ValueError('click region outside client')
+    class Mouse(ctypes.Structure):
+        _fields_ = [('dx',wintypes.LONG),('dy',wintypes.LONG),('data',wintypes.DWORD),
+                    ('flags',wintypes.DWORD),('time',wintypes.DWORD),('extra',ctypes.c_size_t)]
+    class Payload(ctypes.Union):
+        _fields_ = [('mouse',Mouse)]
+    class Input(ctypes.Structure):
+        _fields_ = [('type',wintypes.DWORD),('payload',Payload)]
+    u.SendInput.argtypes = [wintypes.UINT,ctypes.POINTER(Input),ctypes.c_int]
+    u.SendInput.restype = wintypes.UINT
+    u.GetSystemMetrics.argtypes = [ctypes.c_int]
+    left,top,sw,sh = (u.GetSystemMetrics(i) for i in (76,77,78,79))
+    sx,sy = binding.client[0]+x+w//2,binding.client[1]+y+h//2
+    if sw <= 1 or sh <= 1 or not left <= sx < left+sw or not top <= sy < top+sh:
+        raise RuntimeError('invalid virtual screen geometry')
+    events = (Input*3)()
+    events[0].payload.mouse = Mouse(round((sx-left)*65535/(sw-1)),round((sy-top)*65535/(sh-1)),0,0xC001,0,0)
+    events[1].payload.mouse.flags = 0x0002
+    events[2].payload.mouse.flags = 0x0004
+    if not foreground_matches(binding) or not permitted():
+        return False
+    count = u.SendInput(3,events,ctypes.sizeof(Input))
+    if count == 2:
+        release = Input()
+        release.payload.mouse.flags = 0x0004
+        u.SendInput(1,ctypes.byref(release),ctypes.sizeof(Input))
+    if count != 3:
+        raise RuntimeError(f'partial or blocked input: {count}/3 events; do not retry')
+    return True
 
 if __name__ == '__main__':
     binding = find_unique()

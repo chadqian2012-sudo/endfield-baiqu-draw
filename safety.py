@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from collections import deque
 from enum import Enum
 import time
-from ake_core import INITIAL, Observation, Decision, decide
+from ake_core import INITIAL, Observation, Decision, decide, valid_observation
 
 class Action(Enum):
     DRAW = 'draw'
@@ -29,25 +29,14 @@ def stable(frames, now):
         return False
     return a.observation == b.observation == c.observation
 
-def valid(obs):
-    if not obs.stable or not obs.fresh or obs.game_round != 1:
-        return False
-    if len(obs.slots) != 5 or len(obs.inventory) != 5:
-        return False
-    if any(type(v) is not int or v not in range(6) for v in obs.slots):
-        return False
-    if any(type(v) is not int or v < 0 for v in obs.inventory):
-        return False
-    return all(obs.inventory[i-1] + obs.slots.count(i) == INITIAL[i-1] for i in range(1,6))
-
 def draw_completed(before, after):
-    if not valid(before) or not valid(after):
+    if not valid_observation(before) or not valid_observation(after):
         return False
     changes = [(a,b) for a,b in zip(before.slots,after.slots) if a != b]
     return len(changes) == 1 and changes[0][0] == 0 and changes[0][1] in range(1,6)
 
 def initial(obs):
-    return valid(obs) and obs.slots == (0,0,0,0,0) and obs.inventory == INITIAL
+    return valid_observation(obs) and obs.slots == (0,0,0,0,0) and obs.inventory == INITIAL
 
 class ObservationStabilizer:
     """Maintains only three independent captures, with an immediate success freeze."""
@@ -63,7 +52,7 @@ class ObservationStabilizer:
             self.frames.clear()
             return None
         self.frames.append(frame)
-        if stable(list(self.frames), now) and valid(obs):
+        if stable(list(self.frames), now):
             return obs
         return None
 
@@ -104,11 +93,11 @@ class ActionTracker:
         # A possible fourth five freezes actions even before inventory settles.
         if len(obs.slots) == 5 and obs.slots.count(5) >= 4:
             self.candidate = True
-            if valid(obs):
+            if valid_observation(obs):
                 self.stop()
 
     def sent(self, action, before, *, early_restart=False):
-        if self.paused or self.terminated or self.candidate or self.pending is not None or not valid(before):
+        if self.paused or self.terminated or self.candidate or self.pending is not None or not valid_observation(before):
             raise RuntimeError('input blocked')
         if decide(before) == Decision.SUCCESS:
             raise RuntimeError('success freezes input')

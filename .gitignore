@@ -6,3 +6,4 @@ dist/
 logs/
 captures/
 calibration.local.json
+*.spec

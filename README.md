@@ -1,6 +1,59 @@
 # 百趣演武：四张 5 自动抽牌脚本
 
-> **开发中：目前仅有离线策略、人工素材采集与实验性识别工具，不能自动抽牌。** 请先阅读 [开发状态及离线运行说明](PROGRESS.md)。真实窗口校准、完整识别、安全输入、热键和实机验收尚未完成。
+> **0.2.0 首个集成候选版本：程序入口已接通，实机自动抽牌尚未验收。** 当前本地素材不完整，自动模式会拒绝启动。不要把命令存在或 EXE 能启动理解为实机通过。验证状态见 [PROGRESS.md](PROGRESS.md)。
+
+## 安装与运行
+
+Windows 64 位、Python 3.12。解压源码后在项目目录运行：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe ake.py --help
+.\.venv\Scripts\python.exe ake.py math
+```
+
+EXE 使用相同命令，例如 `AKE.exe math`。它是命令行程序，双击后窗口可能立即关闭，应从 PowerShell 运行。源码和 EXE 使用同一视觉、策略和控制器。
+
+## 校准与素材
+
+先把游戏放在前台，运行 `python ake.py calibrate`。依次选择五个牌面数字区域、五个库存数值区域、轮次、三个按钮，以及手牌页和放弃弹窗的独特锚点区域。按 Enter 接受，Esc 取消。未显示的弹窗需从实际截图核对区域后，通过 `--layout` 导入准确布局；不要猜测坐标。默认生成 `calibration.local.json`，绑定本次游戏进程、客户区和 DPI。窗口移动、缩放或客户端重启后重新校准。
+
+布局 JSON 包含 `frame_size: [宽,高]`、`regions`、`groups` 和 `anchors`。`regions.slots` 与 `regions.inventory` 各为五个 `[x,y,宽,高]`；其余区域名为 `round`、`draw`、`abandon`、`confirm`、`hand` 和 `abandon_dialog`。所有坐标相对客户区。可运行 `calibrate --layout 布局.json --output calibration.local.json` 绑定现有布局，不会发送游戏输入。
+
+采集模板时，用人工确认的真实画面逐类添加，例如：
+
+```powershell
+python ake.py sample --profile calibration.local.json --group cards --label 5 --index 0 --batch session-A --score 0.95 --margin 0.1
+```
+
+上述阈值仅演示参数格式，必须用标注集校准。`index` 从 0 开始。也可传 `--image 原始截图.png`，或 `--recording 录制目录 --at 秒数`，画面尺寸必须与布局相同。库存用独立的 `stock` 组，`--digit` 选择分割出的字符；不会从手牌推算库存。模板写入被 Git 忽略的本地 `logs/calibration-assets`。
+
+必要类别：`cards` 为 `empty,1,2,3,4,5`；`stock` 为字符 `0`–`9`；`round` 为 `1,2`；`draw/abandon/confirm` 为 `enabled,disabled`。锚点使用组名 `hand` 或 `abandon_dialog`，不需要 label。每次 sample 都需要明确 batch、score 和 margin。分类分数不是正确概率。区域和图像形状不匹配或类别不完整时返回未知。
+
+## 只读、回放与自动模式
+
+```powershell
+python ake.py observe --profile calibration.local.json --seconds 30
+python ake.py run --dry-run --profile calibration.local.json
+python ake.py replay 录制目录 --profile 该录像的布局.json
+python ake.py validate --profile calibration.local.json --dataset 独立标注.jsonl --output logs/qualification.json
+python ake.py run --live --profile calibration.local.json --qualification logs/qualification.json
+```
+
+`run` 默认 dry-run，只提出建议，不记录假点击或等待假结果。同一状态不反复输出。`observe` 和 dry-run 用 Ctrl+C 结束；replay 不初始化 Windows 输入或热键。旧实验工具 `replay_cards.py` 已被统一的 `ake.py replay` 取代。
+
+独立标注文件每行一个 JSON，必须注明 `source: "real"`、与 `training_batches` 不同的 `batch`、相对标注文件的 `image` 路径，以及 `expected` 中完整的 `slots`、`inventory`、`game_round`、`page`、`buttons`。空槽为 0、未知为 null；page 为 `hand/abandon_dialog/unknown`；buttons 按抽牌、放弃、确认排列，值为 `enabled/disabled/null`。同一批次内需覆盖一次新增一张的变化和未抽满放弃→弹窗→第一轮空牌面、初始库存恢复。校准集与验收集必须按完整采集批次分开；不能改写报告来绕过缺失素材。
+
+自动模式要求类别、区域和锚点完整，且独立验证报告通过并与当前布局和模板指纹一致。F8 开始/暂停，F9 终止退出；失焦暂停，不抢前台、不自动恢复。热键注册失败禁止输入。每次只允许一个待确认动作；默认 10 秒未确认就暂停，不补点。恢复须先对齐已发送动作。候选四张 5 冻结后续输入，稳定核对成功后保存牌面并停止。窗口前台检查与系统发送不是原子操作，不能消除全部切换竞态。
+
+## 日志、限制与打包
+
+事件日志为 `logs/events.jsonl`，每卷 2 MB、最多 3 个备份。成功/错误证据只保存配置的牌槽和库存区域，位于 `logs/evidence`。录屏可能包含其他软件的浮窗；原始录像、模板、日志和校准文件都不上传。证据文件单独保留，需要用户定期归档。
+
+缺模板、库存不一致、窗口身份变化和验证失败均应先检查素材和校准，不应提高点击频率。首次接管非空手牌只读提示，用户手动返回空牌面后再启动。当前缺少完整库存字符、第二轮及独立实机验收素材，尚不能宣称当前电脑可可靠自动运行。
+
+开发验证：`python -m unittest discover -s tests -v`。打包：在隔离环境安装 `pyinstaller==6.11.1` 后运行 `python -m PyInstaller --clean --noconfirm --onefile --name AKE ake.py`。打包产物仍需做实机验收。
 
 以下保留原始开发需求，作为实现和验收依据。
 

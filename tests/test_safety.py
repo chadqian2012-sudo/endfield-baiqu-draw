@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+from ake import drive
 from ake_core import Observation
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, draw_completed, stable
 
@@ -7,6 +9,59 @@ FIVE = Observation((5,0,0,0,0),(6,6,6,6,9),1)
 STALE_STOCK = Observation((5,0,0,0,0),(6,6,6,6,10),1)
 
 class SafetyTests(unittest.TestCase):
+    def run_stream(self, observations, mode='live', stop_after_click=False):
+        class Profile:
+            regions = {'draw':[0,0,1,1],'abandon':[0,0,1,1],'confirm':[0,0,1,1]}
+            def read(self, image): return image,{}
+        now = [0.0]
+        events,clicks = [],[]
+        def frames():
+            for i,obs in enumerate(observations):
+                now[0] = i*.12
+                yield i,now[0],obs,True
+        started = [False]
+        stopped = [False]
+        def keys():
+            if not started[0]:
+                started[0] = True
+                return [0x77]
+            if stop_after_click and clicks and not stopped[0]:
+                stopped[0] = True
+                return [0x78]
+            return []
+        def perform(region, permitted):
+            self.assertTrue(permitted())
+            clicks.append(region)
+            return True
+        with patch('ake.time.monotonic',side_effect=lambda:now[0]):
+            summary = drive(Profile(),frames(),mode=mode,emit=events.append,
+                            keys=keys if mode=='live' else None,perform=perform)
+        return events,clicks,summary
+
+    def test_full_stream_stops_at_four_fives(self):
+        snapshots = []
+        for k in range(5):
+            obs = Observation(tuple([5]*k+[0]*(5-k)),(6,6,6,6,10-k),1,
+                              buttons=('enabled','enabled',None))
+            snapshots.extend([obs]*4)
+        events,clicks,summary = self.run_stream(snapshots)
+        self.assertEqual(len(clicks),4)
+        self.assertEqual(summary['draw_clicks_sent'],4)
+        self.assertEqual(summary['cards_confirmed'],4)
+        self.assertEqual(events[-1]['event'],'success')
+
+    def test_dry_run_does_not_fake_execution(self):
+        events,clicks,summary = self.run_stream([EMPTY]*40,mode='dry-run')
+        self.assertEqual(clicks,[])
+        self.assertEqual(summary['cards_confirmed'],0)
+        self.assertEqual(sum(e['event']=='recommendation' for e in events),1)
+
+    def test_f9_after_sent_click_is_terminal(self):
+        obs = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','enabled',None))
+        events,clicks,_ = self.run_stream([obs]*30,stop_after_click=True)
+        self.assertEqual(len(clicks),1)
+        self.assertEqual(events[-1],{'event':'stopped','reason':'F9'})
+
     def test_stability_requires_distinct_fresh_frames(self):
         frames = [Frame(1,0,EMPTY), Frame(2,.11,EMPTY), Frame(3,.22,EMPTY)]
         self.assertTrue(stable(frames,.3))
