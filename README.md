@@ -15,6 +15,8 @@ python -m venv .venv
 
 EXE 使用相同命令，例如 `AKE.exe math`。它是命令行程序，双击后窗口可能立即关闭，应从 PowerShell 运行。源码和 EXE 使用同一视觉、策略和控制器。
 
+窗口 API 入口会为当前线程建立 Per-Monitor V2 DPI 上下文，让窗口几何、MSS 截图及鼠标坐标计算使用一致的坐标空间；系统不支持或设置失败时明确报错并停止。该线程上下文贯穿窗口操作流程。[微软线程 DPI API 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddpiawarenesscontext)
+
 ## 校准与素材
 
 在终端运行 `python ake.py calibrate`，看到切换提示后在 10 秒内切回游戏。依次选择五个牌面数字区域、五个库存数值区域、轮次、三个按钮，以及手牌页和放弃弹窗的独特锚点区域。按 Enter 接受，Esc 取消。未显示的弹窗需从实际截图核对区域后，通过 `--layout` 导入准确布局；不要猜测坐标。默认生成 `calibration.local.json`，绑定本次游戏进程、客户区和 DPI。窗口移动、缩放或客户端重启后重新校准。
