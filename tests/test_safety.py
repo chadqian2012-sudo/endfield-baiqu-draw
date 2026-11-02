@@ -60,10 +60,13 @@ class SafetyTests(unittest.TestCase):
 
     def run_stream(self, observations, mode='live', stop_after_click=False,
                    stop_at_submission=False, step=.12, save=None, pause_at=None,
-                   sent_times=None, stop_after_confirmation=False, resume_at=None):
+                   sent_times=None, stop_after_confirmation=False, resume_at=None,
+                   read_seconds=None, save_seconds=0):
         class Profile:
             regions = {'draw':[0,0,1,1],'abandon':[0,0,1,1],'confirm':[0,0,1,1]}
-            def read(self, image): return image,{}
+            def read(self, image):
+                if read_seconds: now[0] += read_seconds(image)
+                return image,{}
         now = [0.0]
         events,clicks = [],[]
         def frames():
@@ -98,9 +101,12 @@ class SafetyTests(unittest.TestCase):
             clicks.append(region)
             if sent_times is not None: sent_times.append(now[0])
             return True
+        def persist(image,reason):
+            now[0] += save_seconds
+            return save(image,reason)
         with patch('ake.time.monotonic',side_effect=lambda:now[0]):
             summary = drive(Profile(),frames(),mode=mode,emit=events.append,
-                            keys=keys if mode=='live' else None,perform=perform,save=save)
+                            keys=keys if mode=='live' else None,perform=perform,save=persist if save else None)
         self.assertIs(events[-1],summary)
         self.assertEqual(sum(e['event']=='summary' for e in events),1)
         return events[:-1],clicks,summary
@@ -162,6 +168,49 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(clicks),2)
         self.assertEqual(summary['cards_confirmed'],1)
         self.assertEqual(summary['timings']['draw']['mean'],.375)
+
+    def test_cycle_timing_uses_completed_observations_instead_of_capture_stamps(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        five = Observation(FIVE.slots,FIVE.inventory,1,buttons=('enabled','enabled',None))
+        snapshots = [empty]*3+[five]*3
+        for before,after,expected in ((.02,.2,1.08),(.2,.02,.72)):
+            with self.subTest(read_seconds=(before,after)):
+                sent = []
+                _,clicks,summary = self.run_stream(snapshots,step=.3,sent_times=sent,
+                    read_seconds=lambda obs:before if obs == empty else after)
+                self.assertEqual(len(clicks),2)
+                self.assertAlmostEqual(sent[1]-sent[0],expected)
+                self.assertAlmostEqual(summary['timings']['draw']['mean'],expected)
+                self.assertAlmostEqual(summary['elapsed'],expected)
+        _,clicks,summary = self.run_stream(snapshots,mode='replay',step=.3,
+            read_seconds=lambda obs:.02 if obs == empty else .2)
+        self.assertEqual(clicks,[])
+        self.assertAlmostEqual(summary['elapsed'],.9)
+
+    def test_success_evidence_time_and_failures_preserve_terminal_result(self):
+        snapshots = []
+        for k in range(5):
+            snapshots.extend([Observation(tuple([5]*k+[0]*(5-k)),(6,6,6,6,10-k),1,
+                                          buttons=('enabled','enabled',None))]*3)
+        for error in (None,OSError('disk full'),KeyboardInterrupt()):
+            with self.subTest(save_error=type(error).__name__):
+                save = Mock(return_value='fixture-evidence',side_effect=error)
+                events,clicks,summary = self.run_stream(snapshots,step=.3,save=save,
+                    save_seconds=2,read_seconds=lambda _: .02)
+                self.assertEqual(summary['termination_reason'],'success')
+                self.assertEqual(len(clicks),4)
+                self.assertEqual(summary['cards_confirmed'],4)
+                self.assertAlmostEqual(summary['elapsed'],3.6)
+                self.assertAlmostEqual(summary['evidence_seconds'],2)
+                save.assert_called_once()
+                successes = [event for event in events if event['event']=='success']
+                self.assertEqual(len(successes),1)
+                if error is None:
+                    self.assertIsNone(summary['evidence_error'])
+                    self.assertEqual(successes[0]['evidence'],'fixture-evidence')
+                else:
+                    self.assertIsNotNone(summary['evidence_error'])
+                    self.assertIsNone(successes[0]['evidence'])
 
     def test_confirmed_dialog_and_reset_continue_without_unmeasured_gaps(self):
         empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))

@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from dataclasses import asdict, replace
 import json
+import runpy
 from io import StringIO
 from unittest.mock import Mock, patch
 import numpy as np
@@ -11,6 +12,7 @@ import collect_observation
 from ake import main, validate
 from ake_core import Observation
 from vision import VisionProfile, classify, recognize_card, segment_digits, normalize_digit, recognize_stock, read_image, write_image
+from windowing import WindowIdentity
 
 class VisionTests(unittest.TestCase):
     def test_profile_rejects_inconsistent_card_geometry_before_sampling(self):
@@ -141,6 +143,82 @@ class VisionTests(unittest.TestCase):
                 find_window.assert_not_called()
                 if source: recheck.assert_called_once_with(profile,report.parent/source)
                 else: recheck.assert_not_called()
+
+    def test_live_preserves_success_when_evidence_or_notification_fails(self):
+        binding = WindowIdentity(1,2,3,'fixture.exe',(0,0,8,8),96)
+        success = Observation((5,5,5,5,0),(6,6,6,6,6),1)
+        for failure in ('evidence','notification'):
+            with self.subTest(failure=failure):
+                profile = Mock(config={'window':json.loads(json.dumps(asdict(binding)))})
+                profile.issues.return_value = []
+                profile.read.return_value = success,{}
+                now,events,images = [0.0],[],[object() for _ in range(3)]
+                def frames():
+                    for i,image in enumerate(images):
+                        now[0] = i*.125
+                        yield i,now[0],image,True
+                def save(*_):
+                    now[0] += .25
+                    if failure == 'evidence': raise OSError('disk full')
+                    return 'success-evidence'
+                def notify():
+                    now[0] += .375
+                    if failure == 'notification': raise RuntimeError('sound failed')
+                notifier = Mock(MessageBeep=Mock(side_effect=notify))
+                with patch('vision.VisionProfile',return_value=profile), \
+                     patch('pathlib.Path.read_text',return_value='{"dataset":"fixture.jsonl"}'), \
+                     patch('pathlib.Path.mkdir'), \
+                     patch('ake.validate',return_value={'errors':[]}), \
+                     patch('ake.StrictLog') as log, \
+                     patch('ake.frames_from_window',return_value=frames()), \
+                     patch('windowing.find_unique',return_value=binding), \
+                     patch('windowing.Hotkeys') as hotkeys, \
+                     patch('windowing.click') as click, \
+                     patch('ake.evidence',side_effect=save) as evidence, \
+                     patch('ake.time.monotonic',side_effect=lambda:now[0]), \
+                     patch('ake.dump',side_effect=events.append), \
+                     patch.dict('sys.modules',{'winsound':notifier}):
+                    hotkeys.return_value.poll.return_value = []
+                    code = main(['run','--live','--profile','unused','--qualification','unused'])
+                self.assertEqual(code,1)
+                self.assertEqual(sum(e.get('event') == 'success' for e in events),1)
+                summary = next(e for e in events if e.get('event') == 'summary')
+                self.assertEqual(summary['termination_reason'],'success')
+                if failure == 'evidence': self.assertIn('disk full',summary['evidence_error'])
+                evidence.assert_called_once_with(profile,images[-1],'success')
+                notifier.MessageBeep.assert_called_once_with()
+                notification = next(e for e in events if e.get('event') in ('notification','notification_error'))
+                self.assertEqual(notification['event'],'notification_error' if failure == 'notification' else 'notification')
+                self.assertEqual(notification['elapsed'],.375)
+                click.assert_not_called()
+                hotkeys.return_value.close.assert_called_once_with()
+                log.return_value.close.assert_called_once_with()
+
+    def test_cli_preparation_failures_use_structured_exit_and_preserve_argparse(self):
+        sample = ['sample','--profile','unused','--image','unused','--group','cards',
+                  '--label','5','--score','.95','--margin','.1','--batch','fixture']
+        for args,target,error,event,code in [
+                (['calibrate'],'windowing.find_unique',RuntimeError('missing window'),'error',1),
+                (sample,'vision.read_image',cv2.error('invalid image'),'error',1),
+                (['calibrate'],'windowing.find_unique',KeyboardInterrupt(),'stopped',0)]:
+            with self.subTest(error=type(error).__name__), \
+                 patch('sys.argv',['ake.py',*args]), \
+                 patch('vision.VisionProfile',return_value=Mock()), \
+                 patch(target,side_effect=error), \
+                 patch('sys.stdout',new_callable=StringIO) as output, \
+                 patch('sys.stderr',new_callable=StringIO) as stderr:
+                with self.assertRaises(BaseException) as stopped:
+                    runpy.run_path(str(Path(__file__).resolve().parents[1]/'ake.py'),run_name='__main__')
+                self.assertIsInstance(stopped.exception,SystemExit)
+                self.assertEqual(stopped.exception.code,code)
+                self.assertEqual(json.loads(output.getvalue())['event'],event)
+                self.assertEqual(stderr.getvalue(),'')
+        for args,code in [(['--version'],0),(['--invalid-option'],2)]:
+            with self.subTest(args=args), patch('sys.argv',['ake.py',*args]), \
+                 patch('sys.stdout',new_callable=StringIO), patch('sys.stderr',new_callable=StringIO):
+                with self.assertRaises(SystemExit) as stopped:
+                    runpy.run_path(str(Path(__file__).resolve().parents[1]/'ake.py'),run_name='__main__')
+                self.assertEqual(stopped.exception.code,code)
 
     def test_qualification_requires_correct_rejection_examples(self):
         # Semantic verifier fixture, not evidence that real screenshot recognition passed.

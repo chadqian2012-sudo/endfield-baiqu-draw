@@ -90,7 +90,8 @@ def frames_from_window(binding, seconds):
 def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     """Dry modes never call perform. The main thread owns stop and input order."""
     now = [0.0]
-    tracker = ActionTracker(clock=lambda:now[0])
+    clock = (lambda:now[0]) if mode == 'replay' else time.monotonic
+    tracker = ActionTracker(clock=clock)
     stabilizer = ObservationStabilizer()
     timings = Timings()
     last_hand = None
@@ -108,6 +109,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
 
     def pause(reason):
         nonlocal cycle_clean,paused_started
+        now[0] = clock()
         tracker.pause()
         stabilizer.pause(now[0])
         cycle_clean = False
@@ -117,6 +119,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
 
     def handle_keys():
         nonlocal cycle_clean,cycle_started,paused_started,pause_total,reason
+        now[0] = clock()
         pressed = keys() if keys else []
         if 0x78 in pressed:
             tracker.stop()
@@ -148,37 +151,36 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     if mode == 'live': emit({'event':'armed','message':'F8 start/pause, F9 terminal stop'})
     try:
         for sequence,stamp,image,focused in frames:
-            now[0] = stamp
+            now[0] = stamp if mode == 'replay' else clock()
             handle_keys()
             if tracker.terminated: break
             if not focused:
                 stabilizer.frames.clear()
-                if mode == 'live': stabilizer.pause(stamp)
+                if mode == 'live': stabilizer.pause(now[0])
                 if mode == 'live' and not tracker.paused:
                     pause('focus lost; F8 required after reconciliation')
                 continue
             obs,quality = profile.read(image)
+            observed_at = now[0] = clock()
             last_observation = obs
-            stable_obs = stabilizer.add(Frame(sequence,stamp,obs),stamp if mode == 'replay' else time.monotonic())
+            stable_obs = stabilizer.add(Frame(sequence,stamp,obs),observed_at)
             tracker.candidate = stabilizer.candidate_since is not None
             decision = decide(stable_obs,timings.early_restart) if stable_obs is not None else Decision.WAIT
             if decision == Decision.SUCCESS:
                 if tracker.pending and tracker.pending[1] == Action.DRAW and draw_completed(tracker.pending[2],obs):
                     tracker.reconcile(obs)
                     counters['cards_confirmed'] += 1
-                    timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
+                    timings.add('draw',observed_at-cycle_started,uninterrupted=cycle_clean)
                 tracker.stop()
                 reason = 'success'
-                path = save(image,'success') if save else None
-                emit({'event':'success','observation':asdict(obs),'evidence':path})
                 break
-            if mode == 'live' and stabilizer.candidate_timed_out(stamp,tracker.timeout):
+            if mode == 'live' and stabilizer.candidate_timed_out(observed_at,tracker.timeout):
                 reason = 'suspected success; confirmation timeout'
                 pause(reason)
                 if save: save(image,reason)
                 break
             if (mode == 'live' and not tracker.paused and not tracker.pending and not tracker.candidate
-                    and cycle_started is not None and stamp-cycle_started >= tracker.timeout):
+                    and cycle_started is not None and observed_at-cycle_started >= tracker.timeout):
                 pause('observation or action readiness timed out')
                 if save: save(image,'observation or action readiness timed out')
                 continue
@@ -196,8 +198,8 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 if initial(obs):
                     entered = True
                     last_hand = obs
-                    active_started = stamp
-                    if mode == 'live' and tracker.paused: paused_started = stamp
+                    active_started = observed_at
+                    if mode == 'live' and tracker.paused: paused_started = observed_at
                     new_attempt()
             if mode != 'live':
                 semantic = (obs,decision,entered)
@@ -223,14 +225,14 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
                 if action == Action.DRAW:
                     counters['cards_confirmed'] += 1
-                    timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
+                    timings.add('draw',observed_at-cycle_started,uninterrupted=cycle_clean)
                     last_hand = obs
                 elif action == Action.CONFIRM:
                     counters['restarts_completed'] += 1
-                    timings.add('restart',stamp-reset_started,uninterrupted=cycle_clean)
+                    timings.add('restart',observed_at-reset_started,uninterrupted=cycle_clean)
                     last_hand = obs
                     new_attempt()
-                cycle_started = stamp
+                cycle_started = observed_at
             if tracker.paused or not entered: continue
             if tracker.phase == 'dialog':
                 if obs.page != 'abandon_dialog' or obs.buttons[2] != 'enabled':
@@ -246,7 +248,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 if obs.buttons[0 if action == Action.DRAW else 1] != 'enabled': continue
             handle_keys()
             if tracker.paused or tracker.terminated or time.monotonic()-stamp > .5: continue
-            if not cycle_clean: cycle_started = stamp
+            if not cycle_clean: cycle_started = observed_at
             if action == Action.ABANDON:
                 reset_started = cycle_started
                 cycle_clean = True
@@ -273,11 +275,23 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
         reason = 'error: '+str(error)
         raise
     finally:
-        if paused_started is not None: pause_total += now[0]-paused_started
+        finished_at = now[0] if reason == 'success' else clock()
+        if paused_started is not None: pause_total += finished_at-paused_started
         result = {'event':'summary','termination_reason':reason,**counters,'timings':timings.summary(),
-                  'elapsed':None if active_started is None else now[0]-active_started,'paused_seconds':pause_total,
+                  'elapsed':None if active_started is None else finished_at-active_started,'paused_seconds':pause_total,
                   'last_observation':asdict(last_observation) if last_observation is not None else None,
                   'pending_action':{'id':tracker.pending[0],'action':tracker.pending[1].value} if tracker.pending else None}
+        if reason == 'success':
+            result['evidence'] = None
+            result['evidence_error'] = None
+            started = time.monotonic()
+            try:
+                if save: result['evidence'] = save(image,'success')
+            except (Exception,KeyboardInterrupt) as error:
+                result['evidence_error'] = 'Ctrl+C' if isinstance(error,KeyboardInterrupt) else str(error)
+                emit({'event':'evidence_error','reason':result['evidence_error']})
+            result['evidence_seconds'] = time.monotonic()-started if save else None
+            emit({'event':'success','observation':asdict(last_observation),'evidence':result['evidence']})
         emit(result)
     return result
 
@@ -569,12 +583,8 @@ def main(argv=None):
             for frame in frames:
                 if frame[2] is not None: last_image = frame[2]
                 yield frame
-        drive(profile,remember(),mode=mode,emit=emit,keys=keys.poll if keys else None,
+        result = drive(profile,remember(),mode=mode,emit=emit,keys=keys.poll if keys else None,
                         perform=perform,save=(lambda image,reason:evidence(profile,image,reason)) if live else None)
-        if live:
-            import winsound
-            winsound.MessageBeep()
-        return 0
     except KeyboardInterrupt:
         dump({'event':'stopped','reason':'Ctrl+C'})
         return 0
@@ -584,6 +594,17 @@ def main(argv=None):
             try: dump({'evidence':evidence(profile,last_image,str(error))})
             except Exception as save_error: dump({'evidence_error':str(save_error)})
         return 1
+    else:
+        if live:
+            started = time.monotonic()
+            try:
+                import winsound
+                winsound.MessageBeep()
+            except Exception as error:
+                emit({'event':'notification_error','reason':str(error),'elapsed':time.monotonic()-started})
+                return 1
+            emit({'event':'notification','elapsed':time.monotonic()-started})
+        return 1 if result.get('evidence_error') is not None else 0
     finally:
         if keys: keys.close()
         if handler: handler.close()
@@ -591,6 +612,9 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ValueError,OSError,KeyError) as error:
+    except KeyboardInterrupt:
+        dump({'event':'stopped','reason':'Ctrl+C'})
+        sys.exit(0)
+    except Exception as error:
         dump({'event':'error','reason':str(error)})
         sys.exit(1)
