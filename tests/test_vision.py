@@ -159,22 +159,37 @@ class VisionTests(unittest.TestCase):
                     Observation((None,0,0,0,0),empty.inventory,1,buttons=empty.buttons),
                     Observation(empty.slots,(None,6,6,6,10),1,buttons=empty.buttons)]
         predictions = []
+        recording_images = [np.full((8,8),0 if i == 3 else i,dtype=np.uint8) for i in range(5)]
+        closed_recordings = []
+        consumed_frames = []
+        tail_error = None
+        def recording_frames(recording):
+            try:
+                for i,image in enumerate(recording_images):
+                    consumed_frames.append(i)
+                    yield i,i*.125,image,True
+                if tail_error is not None: raise tail_error
+            finally:
+                closed_recordings.append(recording)
         class Profile:
             CLASSES = VisionProfile.CLASSES
             config = {'training_batches':['calibration']}
-            def read(self, image): return predictions[image],{}
+            def read(self, image):
+                return predictions[int(image[0,0]) if isinstance(image,np.ndarray) else image],{}
             def issues(self): return []
         with TemporaryDirectory() as folder:
             dataset = Path(folder)/'labels.jsonl'
-            def check(samples):
+            def check(samples, recording='evidence'):
                 rows = []
                 for i,obs in enumerate(samples):
                     expected = {key:value for key,value in asdict(obs).items()
                                 if key in ('slots','inventory','game_round','page','buttons')}
-                    rows.append(json.dumps({'source':'real','batch':'held-out','image':str(i),'expected':expected}))
+                    source = {'recording':recording,'frame':i} if recording and i < 4 else {'image':str(i)}
+                    rows.append(json.dumps({'source':'real','batch':'held-out',**source,'expected':expected}))
                 dataset.write_text('\n'.join(rows),encoding='utf-8')
                 return validate(Profile(),dataset)
             with patch('vision.read_image',side_effect=lambda path,flags:int(path.name)), \
+                 patch('ake.frames_from_recording',side_effect=recording_frames) as reader, \
                  patch('ake.fingerprint',return_value='fixture-profile'):
                 for count in range(4):
                     samples = positive+rejected[:count]
@@ -194,8 +209,8 @@ class VisionTests(unittest.TestCase):
                 samples = positive+rejected
                 predictions[:] = samples
                 check(samples)
-                duplicate = json.loads(dataset.read_text(encoding='utf-8').splitlines()[0])
-                duplicate['image'] = './0'
+                duplicate = json.loads(dataset.read_text(encoding='utf-8').splitlines()[4])
+                duplicate['image'] = './4'
                 with dataset.open('a',encoding='utf-8') as file:
                     file.write('\n'+json.dumps(duplicate))
                 report = validate(Profile(),dataset)
@@ -212,6 +227,57 @@ class VisionTests(unittest.TestCase):
                     with self.subTest(unavailable_flow_button=(row,button)):
                         self.assertFalse(report['passed'])
                         self.assertTrue(any(missing_flow in error for error in report['errors']))
+                predictions[:] = positive+rejected
+                report = check(predictions,recording=None)
+                self.assertFalse(report['passed'])
+                self.assertTrue(any('single-draw' in error for error in report['errors']))
+                self.assertTrue(any('early-abandon' in error for error in report['errors']))
+                for case in ('cross-recording','duplicate-frame','reversed-frames','missing-frame'):
+                    check(predictions)
+                    rows = [json.loads(line) for line in dataset.read_text(encoding='utf-8').splitlines()]
+                    if case == 'cross-recording': rows[1]['recording'] = 'other-evidence'
+                    elif case == 'duplicate-frame': rows[3]['frame'] = 0
+                    elif case == 'reversed-frames': rows[0]['frame'],rows[3]['frame'] = 3,0
+                    else: rows[3]['frame'] = 99
+                    dataset.write_text('\n'.join(json.dumps(row) for row in rows),encoding='utf-8')
+                    closed_recordings.clear()
+                    with self.subTest(recording_evidence=case):
+                        report = validate(Profile(),dataset)
+                        self.assertFalse(report['passed'])
+                        self.assertIn(dataset.parent/'evidence',closed_recordings)
+                check(predictions)
+                rows = [json.loads(line) for line in dataset.read_text(encoding='utf-8').splitlines()]
+                rows[2]['frame'],rows[3]['frame'] = 3,4
+                dataset.write_text('\n'.join(json.dumps(row) for row in rows),encoding='utf-8')
+                original_images = recording_images[:]
+                recording_images[:] = [original_images[i] for i in (0,1,4,2,3)]
+                report = validate(Profile(),dataset)
+                recording_images[:] = original_images
+                self.assertFalse(report['passed'])
+                self.assertTrue(any('early-abandon' in error for error in report['errors']))
+                self.assertFalse(any('mismatch' in error for error in report['errors']))
+                recording_images[:] = [original_images[0],original_images[1],
+                                       np.full((8,8),len(positive),dtype=np.uint8),
+                                       original_images[2],original_images[3]]
+                report = validate(Profile(),dataset)
+                recording_images[:] = original_images
+                self.assertTrue(report['passed'])
+                # Independent recording frames may have identical pixels after a full reset.
+                self.assertTrue(np.array_equal(recording_images[0],recording_images[3]))
+                reader.reset_mock()
+                closed_recordings.clear()
+                consumed_frames.clear()
+                self.assertTrue(check(predictions)['passed'])
+                reader.assert_called_once_with(dataset.parent/'evidence')
+                self.assertEqual(consumed_frames,[0,1,2,3,4])
+                self.assertEqual(closed_recordings,[dataset.parent/'evidence'])
+                tail_error = ValueError('invalid recording tail')
+                reader.reset_mock()
+                closed_recordings.clear()
+                with self.assertRaisesRegex(ValueError,'invalid recording tail'):
+                    check(predictions)
+                reader.assert_called_once_with(dataset.parent/'evidence')
+                self.assertEqual(closed_recordings,[dataset.parent/'evidence'])
 
     def test_chinese_absolute_image_path(self):
         with TemporaryDirectory() as folder:

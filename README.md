@@ -47,7 +47,11 @@ python ake.py run --live --profile calibration.local.json --qualification logs/q
 
 运行开始后，正常结束、Ctrl+C 和采集/识别异常都会输出一次 `summary`，包含终止原因、计数、时间、最后一次观察及 `pending_action`；未确认的发送不能当作已抽到的牌。异常仍返回失败退出码，不会因输出摘要而被当作成功。
 
-独立标注文件每行一个 JSON，必须注明 `source: "real"`、与 `training_batches` 不同的 `batch`、相对标注文件的 `image` 路径，以及 `expected` 中完整的 `slots`、`inventory`、`game_round`、`page`、`buttons`。空槽为 0、未知为 null；page 为 `hand/abandon_dialog/unknown`；buttons 按抽牌、放弃、确认排列，值为 `enabled/disabled/null`。同一批次内需覆盖一次新增一张的变化和未抽满放弃→弹窗→第一轮空牌面、初始库存恢复。校准集与验收集必须按完整采集批次分开；不能改写报告来绕过缺失素材。
+独立标注文件每行一个 JSON，必须注明 `source: "real"`、与 `training_batches` 不同的 `batch`，以及 `expected` 中完整的 `slots`、`inventory`、`game_round`、`page`、`buttons`。空槽为 0、未知为 null；page 为 `hand/abandon_dialog/unknown`；buttons 按抽牌、放弃、确认排列，值为 `enabled/disabled/null`。来源二选一：静态图片使用相对标注文件的 `image` 路径；录像帧使用相对标注文件的 `recording` 目录和从 0 开始的整数 `frame`，程序直接读取该目录的 `observation.mp4` 与 `frames.csv`，不使用另外导出的图片。
+
+类别覆盖可以使用静态图片；逐张抽牌和未抽满放弃→弹窗→第一轮空牌面、初始库存恢复的流程证据，必须是标注中相邻且来自同批次、同一录像的递增帧。每段录像只顺序扫描一次，并核对完整视频/时间戳记录。重复帧、倒序帧和不存在的帧均拒绝；不同独立帧即使像素相同也可核对。旧的全静态验收集需补齐原始录像帧再验证。录像是否来自当前真实客户端、是否与校准集独立，仍须人工按完整采集批次确认；填写批次名不能替代这项核对。
+
+标注之间的中间帧也会逐帧识别：例如放弃前已出现不同手牌或抽满五张，不能通过跳过该帧证明“未抽满放弃”。已知牌槽、库存或轮次与所标流程冲突时拒绝；未知动画字段继续保留未知，不补全牌面。录像中的人工操作及未知过渡仍需人工核对，程序只核验采样记录中可观察到的状态。
 
 验证集还必须包含未知页、手牌页的未知牌槽和未知库存反例，程序读数须逐字段符合标注；只有正常静止正例不能通过。旧报告的缓存结论不能替代当前素材检查。
 

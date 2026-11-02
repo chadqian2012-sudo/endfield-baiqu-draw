@@ -1,6 +1,7 @@
 """Windows CLI for calibrated observation, replay and qualified automation."""
 import argparse
 import csv
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime
 import hashlib
@@ -291,25 +292,57 @@ def validate(profile, dataset):
     history = []
     total = 0
     rejection_cases = set()
-    seen_images = set()
+    seen_sources = set()
+    recordings = {}
     training = set(profile.config.get('training_batches',[]))
     if not training: errors.append('profile must name training_batches')
-    with dataset.open(encoding='utf-8-sig') as f:
+
+    def compatible(obs, hands):
+        return obs.page == 'unknown' or (obs.page == 'hand' and obs.game_round in (None,1)
+                and all(value is None or any(value == hand.slots[i] for hand in hands)
+                        for i,value in enumerate(obs.slots))
+                and all(value is None or any(value == hand.inventory[i] for hand in hands)
+                        for i,value in enumerate(obs.inventory)))
+
+    with dataset.open(encoding='utf-8-sig') as f, ExitStack() as cleanup:
         for line_number,line in enumerate(f,1):
             row = json.loads(line)
-            source = (dataset.parent/row['image']).resolve()
-            if source in seen_images:
-                errors.append(f'row {line_number}: repeated validation image')
+            if ('image' in row) == ('recording' in row):
+                raise ValueError('validation row requires exactly one image or recording source')
+            recording = (dataset.parent/row['recording']).resolve() if 'recording' in row else None
+            sequence = row.get('frame') if recording is not None else None
+            if recording is not None and (type(sequence) is not int or sequence < 0):
+                errors.append(f'row {line_number}: invalid validation frame index')
                 continue
-            seen_images.add(source)
-            total += 1
+            source = (recording,sequence) if recording is not None else (dataset.parent/row['image']).resolve()
+            if source in seen_sources:
+                errors.append(f'row {line_number}: repeated validation image or frame')
+                continue
+            seen_sources.add(source)
             if not row.get('batch') or row['batch'] in training:
                 errors.append(f'row {line_number}: missing or overlapping batch')
             if row.get('source') != 'real':
                 errors.append(f'row {line_number}: real-client evidence required for live qualification')
-            image = read_image(source,cv2.IMREAD_COLOR)
-            if image is None: raise ValueError('missing validation image')
-            actual,_ = profile.read(image)
+            if recording is not None:
+                if recording not in recordings:
+                    recordings[recording] = (frames_from_recording(recording),[])
+                    cleanup.callback(recordings[recording][0].close)
+                frames,trace = recordings[recording]
+                for frame in frames:
+                    trace.append(profile.read(frame[2])[0])
+                    if frame[0] >= sequence: break
+                else:
+                    errors.append(f'row {line_number}: missing or out-of-order recording frame')
+                    continue
+                if frame[0] != sequence:
+                    errors.append(f'row {line_number}: missing or out-of-order recording frame')
+                    continue
+                actual = trace[-1]
+            else:
+                image = read_image(source,cv2.IMREAD_COLOR)
+                if image is None: raise ValueError('missing validation image')
+                actual,_ = profile.read(image)
+            total += 1
             expected = row['expected']
             if set(expected) != {'slots','inventory','game_round','page','buttons'}:
                 errors.append(f'row {line_number}: incomplete annotation')
@@ -329,7 +362,7 @@ def validate(profile, dataset):
                 count['correct' if predicted == label else 'rejected' if predicted is None else 'wrong'] += 1
             obs = Observation(tuple(expected['slots']),tuple(expected['inventory']),expected['game_round'],
                               page=expected['page'],buttons=tuple(expected['buttons']))
-            history.append((row.get('batch'),obs))
+            history.append((row.get('batch'),recording,sequence,obs))
             if obs.page == 'unknown': rejection_cases.add('unknown_page')
             if obs.page == 'hand':
                 if None in obs.slots: rejection_cases.add('unknown_slot')
@@ -339,11 +372,20 @@ def validate(profile, dataset):
                 if obs.game_round is not None: coverage['round'].add(str(obs.game_round))
             for i,name in enumerate(('draw','abandon','confirm')):
                 if obs.buttons[i] is not None: coverage[name].add(obs.buttons[i])
-    early_reset = any(ba == bb == bc and valid_observation(a) and 0 < sum(v != 0 for v in a.slots) < 5
+        for frames,_ in recordings.values():
+            for _ in frames: pass
+    early_reset = any(ra is not None and ra == rb == rc and sa < sb < sc and ba == bb == bc
+                      and valid_observation(a) and 0 < sum(v != 0 for v in a.slots) < 5
                       and a.buttons[1] == 'enabled' and b.page == 'abandon_dialog'
                       and b.buttons[2] == 'enabled' and initial(c)
-                      for (ba,a),(bb,b),(bc,c) in zip(history,history[1:],history[2:]))
-    single_draw = any(ba == bb and a.buttons[0] == 'enabled' and draw_completed(a,b) for (ba,a),(bb,b) in zip(history,history[1:]))
+                      and all(compatible(obs,(a,)) for obs in recordings[ra][1][sa:sb])
+                      and all(obs.page == 'abandon_dialog' or compatible(obs,(a,c))
+                              for obs in recordings[ra][1][sb:sc+1])
+                      for (ba,ra,sa,a),(bb,rb,sb,b),(bc,rc,sc,c) in zip(history,history[1:],history[2:]))
+    single_draw = any(ra is not None and ra == rb and sa < sb and ba == bb
+                      and a.buttons[0] == 'enabled' and draw_completed(a,b)
+                      and all(compatible(obs,(a,b)) for obs in recordings[ra][1][sa:sb+1])
+                      for (ba,ra,sa,a),(bb,rb,sb,b) in zip(history,history[1:]))
     for name,classes in profile.CLASSES.items():
         missing = classes-coverage[name]
         if missing: errors.append(name+': validation missing '+','.join(sorted(missing)))
