@@ -27,6 +27,12 @@ class SafetyTests(unittest.TestCase):
             self.assertIs(frames[0][2],images[0])
             self.assertIs(frames[1][2],images[1])
             video.release.assert_called_once()
+            video.reset_mock()
+            video.isOpened.return_value = False
+            with patch('cv2.VideoCapture',return_value=video), self.assertRaisesRegex(ValueError,'cannot open recording'):
+                list(frames_from_recording(recording))
+            video.release.assert_called_once()
+            video.read.assert_not_called()
 
     def test_recording_rejects_invalid_timeline_or_frame_count(self):
         cases = [('0,0\n2,0.2\n',2), ('0,0.2\n1,0.2\n',2),

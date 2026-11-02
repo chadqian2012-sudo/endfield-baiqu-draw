@@ -53,8 +53,8 @@ def evidence(profile, image, reason):
 def frames_from_recording(recording):
     import cv2
     video = cv2.VideoCapture(str(recording/'observation.mp4'))
-    if not video.isOpened(): raise ValueError('cannot open recording')
     try:
+        if not video.isOpened(): raise ValueError('cannot open recording')
         with (recording/'frames.csv').open(encoding='utf-8',newline='') as f:
             previous_time = None
             for index,row in enumerate(csv.DictReader(f)):
@@ -495,7 +495,7 @@ def main(argv=None):
                 cv2.destroyAllWindows()
             config['window'] = asdict(binding)
             VisionProfile.check_regions(config['frame_size'],config['regions'])
-            args.output.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
+            VisionProfile.save_config(args.output,config)
             dump({'calibration':str(args.output),'issues':VisionProfile(args.output).issues()})
             return 0
         profile = VisionProfile(args.layout)
@@ -507,7 +507,7 @@ def main(argv=None):
         for anchor in config.get('anchors',{}).values():
             anchor['template'] = str((profile.path.parent/anchor['template']).resolve())
         config['window'] = asdict(binding)
-        args.output.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
+        VisionProfile.save_config(args.output,config)
         dump({'calibration':str(args.output),'issues':profile.issues()})
         return 0
     profile = VisionProfile(args.profile)

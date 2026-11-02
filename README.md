@@ -21,6 +21,8 @@ EXE 使用相同命令，例如 `AKE.exe math`。它是命令行程序，双击�
 
 第一槽选框确定共享模板的裁剪宽高；后四槽只取所选区域的左上角，界面会提示固定尺寸，不缩放牌面图像。导入布局的五槽宽高必须一致，已有牌面模板也须符合该尺寸。新区域在写入前校验；取消或无效区域不会覆盖原配置。
 
+校准与采样配置先写入同目录的唯一临时文件，完成写入和同步后再替换目标，避免写入故障截断已有 JSON。采样先修改配置草稿，保存成功后才更新内存。新生成但未提交的局部素材可能保留在 `logs/calibration-assets`，避免中断后误删已经生效的引用；这些素材及 `.ake-config-*.tmp` 临时文件均受 Git 忽略。
+
 布局 JSON 包含 `frame_size: [宽,高]`、`regions`、`groups` 和 `anchors`。`regions.slots` 与 `regions.inventory` 各为五个 `[x,y,宽,高]`；其余区域名为 `round`、`draw`、`abandon`、`confirm`、`hand` 和 `abandon_dialog`。所有坐标相对客户区。可运行 `calibrate --layout 布局.json --output calibration.local.json` 绑定现有布局，不会发送游戏输入。
 
 采集模板时，用人工确认的真实画面逐类添加，例如：

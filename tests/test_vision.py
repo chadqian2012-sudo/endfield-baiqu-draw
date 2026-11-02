@@ -58,38 +58,54 @@ class VisionTests(unittest.TestCase):
     def test_recording_preserves_calibration_geometry_and_masks_account_strip(self):
         binding = Mock(client=(20,30,100,100),hwnd=1)
         source = np.random.default_rng(7).integers(0,256,(100,100,4),dtype=np.uint8)
-        frames = []
-        writer = Mock()
-        writer.isOpened.return_value = True
-        writer.write.side_effect = lambda frame:frames.append(frame.copy())
-        capture = Mock()
-        capture.grab.return_value = source
-        with TemporaryDirectory() as folder:
-            root = Path(folder)
-            with patch('sys.argv',['collect_observation.py','--seconds','1','--fps','5']), \
-                 patch('sys.stdout',new_callable=StringIO), \
-                 patch('collect_observation.find_unique',return_value=binding), \
-                 patch('collect_observation.snapshot',return_value=binding), \
-                 patch('collect_observation.foreground_matches',return_value=True), \
-                 patch('collect_observation.Path',return_value=root/'captures'), \
-                 patch('collect_observation.cv2.VideoWriter',return_value=writer) as create_writer, \
-                 patch('collect_observation.mss.mss') as mss, \
-                 patch('collect_observation.time.monotonic',side_effect=[0,0,.1,.2,1.1]), \
-                 patch('collect_observation.time.sleep'):
-                mss.return_value.__enter__.return_value = capture
-                collect_observation.main()
-            self.assertEqual(create_writer.call_args.args[-1],(100,100))
-            capture.grab.assert_called_once_with({'left':20,'top':30,'width':100,'height':100})
-            self.assertEqual(len(frames),1)
-            self.assertEqual(frames[0].shape,(100,100,3))
-            np.testing.assert_array_equal(frames[0][:95],source[:95,:,:3])
-            self.assertFalse(np.any(frames[0][95:]))
-            writer.release.assert_called_once()
-            profile_path = root/'profile.json'
-            profile_path.write_text(json.dumps({'frame_size':[100,100],
-                'regions':{'slots':[[5,5,20,20]]*5},'groups':{},'anchors':{}}),encoding='utf-8')
-            VisionProfile(profile_path).add_sample(frames[0],'cards','5',0,0,.95,.1,'fixture')
-            self.assertIn('5',VisionProfile(profile_path).groups['cards'][0])
+        real_open = Path.open
+        for failure in (None,'unavailable','csv-open','mss-create','mss-enter','header-write'):
+            with self.subTest(failure=failure), TemporaryDirectory() as folder:
+                root = Path(folder)
+                frames = []
+                writer = Mock()
+                writer.isOpened.return_value = failure != 'unavailable'
+                writer.write.side_effect = lambda frame:frames.append(frame.copy())
+                capture = Mock()
+                capture.grab.return_value = source
+                with patch('sys.argv',['collect_observation.py','--seconds','1','--fps','5']), \
+                     patch('sys.stdout',new_callable=StringIO), \
+                     patch('collect_observation.find_unique',return_value=binding), \
+                     patch('collect_observation.snapshot',return_value=binding), \
+                     patch('collect_observation.foreground_matches',return_value=True), \
+                     patch('collect_observation.Path',return_value=root/'captures'), \
+                     patch('collect_observation.cv2.VideoWriter',return_value=writer) as create_writer, \
+                     patch('collect_observation.mss.mss') as mss, \
+                     patch.object(Path,'open',autospec=True,side_effect=real_open) as open_csv, \
+                     patch('collect_observation.csv.writer',wraps=collect_observation.csv.writer) as csv_writer, \
+                     patch('collect_observation.time.monotonic',side_effect=[0,0,.1,.2,1.1]), \
+                     patch('collect_observation.time.sleep'):
+                    mss.return_value.__enter__.return_value = capture
+                    if failure == 'csv-open': open_csv.side_effect = OSError(failure)
+                    elif failure == 'mss-create': mss.side_effect = OSError(failure)
+                    elif failure == 'mss-enter': mss.return_value.__enter__.side_effect = OSError(failure)
+                    elif failure == 'header-write': csv_writer.return_value = Mock(writerow=Mock(side_effect=OSError(failure)))
+                    if failure:
+                        with self.assertRaisesRegex(SystemExit if failure == 'unavailable' else OSError,failure):
+                            collect_observation.main()
+                    else:
+                        collect_observation.main()
+                self.assertEqual(create_writer.call_args.args[-1],(100,100))
+                writer.release.assert_called_once()
+                if failure:
+                    writer.write.assert_not_called()
+                    capture.grab.assert_not_called()
+                    continue
+                capture.grab.assert_called_once_with({'left':20,'top':30,'width':100,'height':100})
+                self.assertEqual(len(frames),1)
+                self.assertEqual(frames[0].shape,(100,100,3))
+                np.testing.assert_array_equal(frames[0][:95],source[:95,:,:3])
+                self.assertFalse(np.any(frames[0][95:]))
+                profile_path = root/'profile.json'
+                profile_path.write_text(json.dumps({'frame_size':[100,100],
+                    'regions':{'slots':[[5,5,20,20]]*5},'groups':{},'anchors':{}}),encoding='utf-8')
+                VisionProfile(profile_path).add_sample(frames[0],'cards','5',0,0,.95,.1,'fixture')
+                self.assertIn('5',VisionProfile(profile_path).groups['cards'][0])
 
     def test_recording_rejects_odd_geometry_without_cropping(self):
         for size in ((101,100),(100,101)):
@@ -121,6 +137,48 @@ class VisionTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(),original)
                     self.assertFalse((root/'logs').exists())
                     self.assertEqual(profile.config,config)
+
+    def test_sample_commit_failures_preserve_profile_and_memory(self):
+        frame = np.arange(64,dtype=np.uint8).reshape(8,8)
+        config = {'frame_size':[8,8],'regions':{'slots':[[0,0,8,8]]*5},
+                  'groups':{},'anchors':{},'training_batches':['old-batch']}
+        for failure in ('fsync','replace'):
+            with self.subTest(failure=failure), TemporaryDirectory() as folder:
+                root = Path(folder)
+                path = root/'profile.json'
+                path.write_text(json.dumps(config),encoding='utf-8')
+                original = path.read_bytes()
+                profile = VisionProfile(path)
+                target = 'os.fsync' if failure == 'fsync' else 'pathlib.Path.replace'
+                with patch(target,side_effect=OSError('commit failure')):
+                    with self.assertRaisesRegex(OSError,'commit failure'):
+                        profile.add_sample(frame,'cards','5',0,0,.95,.1,'new-batch')
+                self.assertEqual(path.read_bytes(),original)
+                self.assertEqual(profile.config,config)
+                self.assertEqual(list(root.glob('.ake-config-*.tmp')),[])
+
+    def test_calibration_commit_failure_preserves_old_output(self):
+        binding = WindowIdentity(1,2,3,'fixture.exe',(0,0,8,8),96)
+        frame = np.arange(64,dtype=np.uint8).reshape(8,8)
+        config = {'frame_size':[8,8],'regions':{'slots':[[0,0,8,8]]*5},'groups':{},'anchors':{}}
+        for interactive in (True,False):
+            with self.subTest(interactive=interactive), TemporaryDirectory() as folder:
+                root = Path(folder)
+                output,layout = root/'output.json',root/'layout.json'
+                output.write_text(json.dumps(config),encoding='utf-8')
+                layout.write_text(json.dumps(config),encoding='utf-8')
+                original = output.read_bytes()
+                args = ['calibrate','--output',str(output)]
+                if not interactive: args += ['--layout',str(layout)]
+                with patch('windowing.find_unique',return_value=binding), \
+                     patch('ake.frames_from_window',return_value=iter([(0,0,frame,True)])), \
+                     patch('cv2.selectROI',return_value=(0,0,8,8)), \
+                     patch('cv2.destroyAllWindows'), patch('ake.dump'), \
+                     patch.object(Path,'replace',side_effect=OSError('commit failure')):
+                    with self.assertRaisesRegex(OSError,'commit failure'):
+                        main(args)
+                self.assertEqual(output.read_bytes(),original)
+                self.assertEqual(list(root.glob('.ake-config-*.tmp')),[])
 
     def test_live_rejects_old_report_before_initializing_windows_input(self):
         profile = Mock()
