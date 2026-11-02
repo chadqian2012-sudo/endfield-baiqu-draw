@@ -1,7 +1,7 @@
 """Temporary read-only recording for manual game-flow validation on Windows.
 
-Records only while the Endfield window is foreground. Saves the upper 95% of
-the client area, excluding the UID visible at the bottom of the tested layout.
+Records only while the Endfield window is foreground. Preserves client geometry
+and masks its bottom 5%, containing the UID in the tested layout.
 Local captures are private and excluded from Git. No input is sent.
 """
 import argparse
@@ -23,14 +23,14 @@ def main():
         raise SystemExit('duration or FPS out of bounds')
     binding = find_unique()
     left,top,width,height = binding.client
-    cropped_height = int(height * .95) // 2 * 2
-    width = width // 2 * 2
-    if width < 100 or cropped_height < 100:
+    if width < 100 or height < 100:
         raise SystemExit('Invalid game window size')
-    region = {'left': left, 'top': top, 'width': width, 'height': cropped_height}
+    if width % 2 or height % 2:
+        raise SystemExit('Recording requires even client width and height; resize and recalibrate')
+    region = {'left': left, 'top': top, 'width': width, 'height': height}
     outdir = Path('captures') / datetime.now().strftime('%Y%m%d-%H%M%S')
     outdir.mkdir(parents=True, exist_ok=False)
-    writer = cv2.VideoWriter(str(outdir / 'observation.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), args.fps, (width, cropped_height))
+    writer = cv2.VideoWriter(str(outdir / 'observation.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), args.fps, (width, height))
     if not writer.isOpened():
         raise SystemExit('Video writer unavailable')
     start = time.monotonic()
@@ -48,8 +48,9 @@ def main():
                 if snapshot(binding.hwnd) != binding:
                     raise RuntimeError('Window identity or geometry changed; stopping')
                 if foreground_matches(binding):
-                    frame = np.asarray(capture.grab(region))
-                    writer.write(cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR))
+                    frame = cv2.cvtColor(np.asarray(capture.grab(region)),cv2.COLOR_BGRA2BGR)
+                    frame[int(height*.95):] = 0
+                    writer.write(frame)
                     log.writerow([frames, f'{tick-start:.6f}'])
                     frames += 1
                 time.sleep(max(0, 1/args.fps - (time.monotonic()-tick)))

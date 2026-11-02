@@ -1,37 +1,34 @@
 """Create a contact sheet from a local observation video and its timestamp log."""
 import argparse
-import csv
 from pathlib import Path
 import cv2
 import numpy as np
 from vision import write_image
+from ake import frames_from_recording
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('recording', type=Path)
     p.add_argument('--times', type=float, nargs='+', required=True)
     args = p.parse_args()
-    with (args.recording/'frames.csv').open(encoding='utf-8', newline='') as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
+    selected = [None]*len(args.times)
+    distances = [float('inf')]*len(args.times)
+    for sequence,stamp,frame,_ in frames_from_recording(args.recording):
+        for i,requested in enumerate(args.times):
+            distance = abs(stamp-requested)
+            if distance < distances[i]:
+                selected[i] = (sequence,stamp,frame)
+                distances[i] = distance
+    if any(frame is None for frame in selected):
         raise SystemExit('No recorded frames')
-    video = cv2.VideoCapture(str(args.recording/'observation.mp4'))
-    if not video.isOpened():
-        raise SystemExit('Cannot open recording')
     tiles = []
-    for requested in args.times:
-        row = min(rows, key=lambda r: abs(float(r['elapsed_seconds'])-requested))
-        video.set(cv2.CAP_PROP_POS_FRAMES, int(row['frame']))
-        ok, frame = video.read()
-        if not ok:
-            raise SystemExit(f"Cannot read frame {row['frame']}")
+    for sequence,stamp,frame in selected:
         width = 640
         height = round(frame.shape[0] * width / frame.shape[1])
         tile = cv2.resize(frame, (width,height), interpolation=cv2.INTER_AREA)
-        cv2.putText(tile, f"t={float(row['elapsed_seconds']):.2f}s frame={row['frame']}", (8,25), cv2.FONT_HERSHEY_SIMPLEX, .6, (0,0,0), 3)
-        cv2.putText(tile, f"t={float(row['elapsed_seconds']):.2f}s frame={row['frame']}", (8,25), cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 1)
+        cv2.putText(tile, f"t={stamp:.2f}s frame={sequence}", (8,25), cv2.FONT_HERSHEY_SIMPLEX, .6, (0,0,0), 3)
+        cv2.putText(tile, f"t={stamp:.2f}s frame={sequence}", (8,25), cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 1)
         tiles.append(tile)
-    video.release()
     columns = min(3,len(tiles))
     while len(tiles) % columns:
         tiles.append(np.zeros_like(tiles[0]))

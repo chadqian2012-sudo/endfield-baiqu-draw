@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import Mock, patch
-from ake import drive
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from ake import drive, frames_from_recording
 from ake_core import Observation
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, draw_completed, stable
 from windowing import WindowIdentity, click
@@ -10,6 +12,37 @@ FIVE = Observation((5,0,0,0,0),(6,6,6,6,9),1)
 STALE_STOCK = Observation((5,0,0,0,0),(6,6,6,6,10),1)
 
 class SafetyTests(unittest.TestCase):
+    def test_recording_matches_csv_frames_and_releases_video(self):
+        with TemporaryDirectory() as folder:
+            recording = Path(folder)
+            (recording/'frames.csv').write_text('frame,elapsed_seconds\n0,0\n1,0.12\n',encoding='utf-8')
+            images = [object(),object()]
+            video = Mock()
+            video.isOpened.return_value = True
+            video.read.side_effect = [(True,image) for image in images]+[(False,None)]
+            with patch('cv2.VideoCapture',return_value=video):
+                frames = list(frames_from_recording(recording))
+            self.assertEqual([(f[0],f[1]) for f in frames],[(0,0),(1,.12)])
+            self.assertIs(frames[0][2],images[0])
+            self.assertIs(frames[1][2],images[1])
+            video.release.assert_called_once()
+
+    def test_recording_rejects_invalid_timeline_or_frame_count(self):
+        cases = [('0,0\n2,0.2\n',2), ('0,0.2\n1,0.2\n',2),
+                 ('0,0.2\n1,0.1\n',2), ('0,nan\n',1), ('0,inf\n',1),
+                 ('0,0\n1,0.12\n2,0.24\n',2), ('0,0\n',2)]
+        with TemporaryDirectory() as folder:
+            recording = Path(folder)
+            for rows,count in cases:
+                with self.subTest(rows=rows,video_frames=count):
+                    (recording/'frames.csv').write_text('frame,elapsed_seconds\n'+rows,encoding='utf-8')
+                    video = Mock()
+                    video.isOpened.return_value = True
+                    video.read.side_effect = [(True,object()) for _ in range(count)]+[(False,None)]
+                    with patch('cv2.VideoCapture',return_value=video), self.assertRaises(ValueError):
+                        list(frames_from_recording(recording))
+                    video.release.assert_called_once()
+
     def test_input_is_rejected_when_focus_changes_during_identity_check(self):
         binding = WindowIdentity(1,10,20,'game.exe',(0,0,100,100),96)
         foreground = [binding.hwnd]
@@ -59,7 +92,45 @@ class SafetyTests(unittest.TestCase):
         with patch('ake.time.monotonic',side_effect=lambda:now[0]):
             summary = drive(Profile(),frames(),mode=mode,emit=events.append,
                             keys=keys if mode=='live' else None,perform=perform,save=save)
-        return events,clicks,summary
+        self.assertIs(events[-1],summary)
+        self.assertEqual(sum(e['event']=='summary' for e in events),1)
+        return events[:-1],clicks,summary
+
+    def test_source_interruptions_preserve_summary_and_propagate(self):
+        class Profile:
+            def read(self,image): return EMPTY,{}
+        for error,reason in [(KeyboardInterrupt(),'Ctrl+C'),(OSError('capture failed'),'error: capture failed')]:
+            with self.subTest(error=type(error).__name__):
+                events = []
+                def frames():
+                    for i in range(3): yield i,i*.125,None,True
+                    raise error
+                with patch('ake.time.monotonic',return_value=.25),self.assertRaises(type(error)):
+                    drive(Profile(),frames(),mode='dry-run',emit=events.append)
+                summaries = [e for e in events if e['event']=='summary']
+                self.assertEqual(len(summaries),1)
+                self.assertEqual(summaries[0]['termination_reason'],reason)
+                self.assertEqual(summaries[0]['attempts_confirmed'],1)
+                self.assertEqual(summaries[0]['draw_clicks_sent'],0)
+
+    def test_capture_failure_preserves_unconfirmed_action_in_summary(self):
+        obs = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','enabled',None))
+        class Profile:
+            regions = {'draw':[0,0,1,1]}
+            def read(self,image): return obs,{}
+        def frames():
+            for i in range(3): yield i,i*.125,None,True
+            raise OSError('capture failed')
+        events = []
+        keys = Mock(side_effect=[[0x77],[],[],[],[]])
+        def perform(region,permitted): return permitted()
+        with patch('ake.time.monotonic',return_value=.25),self.assertRaises(OSError):
+            drive(Profile(),frames(),mode='live',emit=events.append,keys=keys,perform=perform)
+        summary = events[-1]
+        self.assertEqual(summary['event'],'summary')
+        self.assertEqual(summary['draw_clicks_sent'],1)
+        self.assertEqual(summary['cards_confirmed'],0)
+        self.assertEqual(summary['pending_action'],{'id':1,'action':'draw'})
 
     def test_full_stream_stops_at_four_fives(self):
         snapshots = []
