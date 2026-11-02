@@ -184,11 +184,10 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 pause('observation or action readiness timed out')
                 if save: save(image,'observation or action readiness timed out')
                 continue
-            if stable_obs is None:
-                if mode == 'live' and not tracker.candidate and tracker.check_timeout():
-                    pause(tracker.error)
-                    if save: save(image,tracker.error)
-                continue
+            if mode == 'live' and not tracker.candidate and tracker.check_timeout():
+                pause(tracker.error)
+                if save: save(image,tracker.error)
+            if stable_obs is None: continue
             if tracker.candidate:
                 if last_output != 'candidate':
                     emit({'event':'suspected_success','reason':'input frozen; awaiting consistent inventory'})
@@ -218,9 +217,6 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 _,action,_ = tracker.pending
                 dialog = obs.page == 'abandon_dialog' and obs.buttons[2] == 'enabled'
                 if not tracker.reconcile(obs,expected_abandon_dialog=dialog):
-                    if tracker.check_timeout():
-                        pause(tracker.error)
-                        if save: save(image,tracker.error)
                     continue
                 emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
                 if action == Action.DRAW:
