@@ -2,7 +2,7 @@ import unittest
 import cv2
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from io import StringIO
 from unittest.mock import Mock, patch
@@ -13,6 +13,46 @@ from ake_core import Observation
 from vision import VisionProfile, classify, recognize_card, segment_digits, normalize_digit, recognize_stock, read_image, write_image
 
 class VisionTests(unittest.TestCase):
+    def test_profile_rejects_inconsistent_card_geometry_before_sampling(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_image(root/'good.png',np.arange(64,dtype=np.uint8).reshape(8,8))
+            write_image(root/'narrow.png',np.arange(56,dtype=np.uint8).reshape(8,7))
+            config = {'frame_size':[8,8],'regions':{'slots':[[0,0,8,8] for _ in range(5)]},
+                      'groups':{'cards':{'templates':{'5':['good.png']},'thresholds':{'5':.95},'margin':.1}},'anchors':{}}
+            path = root/'profile.json'
+            for case in ('slot','template'):
+                invalid = json.loads(json.dumps(config))
+                if case == 'slot': invalid['regions']['slots'][1][2] = 7
+                else: invalid['groups']['cards']['templates']['5'].append('narrow.png')
+                path.write_text(json.dumps(invalid),encoding='utf-8')
+                original = path.read_bytes()
+                with self.subTest(case=case), self.assertRaisesRegex(ValueError,'same width and height|template dimensions'):
+                    VisionProfile(path)
+                self.assertEqual(path.read_bytes(),original)
+                self.assertFalse((root/'logs').exists())
+            with self.assertRaisesRegex(ValueError,'same width and height'):
+                VisionProfile.check_regions((8,8),{'slots':[[0,0,8,8],[0,0,7,8]]+[[0,0,8,8]]*3})
+
+    def test_equal_slot_shapes_share_new_samples_without_poisoning_other_slots(self):
+        rng = np.random.default_rng(23)
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            images = {label:rng.integers(0,256,(8,8),dtype=np.uint8) for label in ('empty','1','2','3','4','5')}
+            for label,image in images.items(): write_image(root/(label+'.png'),image)
+            slots = [[0,0,8,8]]+[[8,0,8,8]]*4
+            config = {'frame_size':[16,8],'regions':{'slots':slots},'anchors':{},'groups':{'cards':{
+                'templates':{label:[label+'.png'] for label in images},'thresholds':{label:.9 for label in images},'margin':.1}}}
+            path = root/'profile.json'
+            path.write_text(json.dumps(config),encoding='utf-8')
+            frame = np.hstack([images['1'],images['5']])
+            profile = VisionProfile(path)
+            self.assertEqual(profile.match_group(frame,'cards',slots[0]).label,'1')
+            profile.add_sample(frame,'cards','5',1,0,.9,.1,'second-slot')
+            profile = VisionProfile(path)
+            self.assertEqual(profile.match_group(frame,'cards',slots[0]).label,'1')
+            self.assertEqual(profile.match_group(frame,'cards',slots[1]).label,'5')
+
     def test_recording_preserves_calibration_geometry_and_masks_account_strip(self):
         binding = Mock(client=(20,30,100,100),hwnd=1)
         source = np.random.default_rng(7).integers(0,256,(100,100,4),dtype=np.uint8)
@@ -85,15 +125,22 @@ class VisionTests(unittest.TestCase):
         profile.issues.return_value = []
         with TemporaryDirectory() as folder:
             report = Path(folder)/'old-report.json'
-            report.write_text(json.dumps({'passed':True,'profile_sha256':'fixture-profile'}),encoding='utf-8')
-            with patch('vision.VisionProfile',return_value=profile), \
-                 patch('ake.fingerprint',return_value='fixture-profile'), \
-                 patch('windowing.find_unique') as find_window, \
-                 patch('sys.stdout',new_callable=StringIO) as output:
-                code = main(['run','--live','--profile','unused.json','--qualification',str(report)])
-            self.assertEqual(code,2)
-            self.assertEqual(json.loads(output.getvalue())['event'],'live_blocked')
-            find_window.assert_not_called()
+            for source in (None,'source.jsonl'):
+                cached = {'passed':True,'profile_sha256':'fixture-profile',
+                          'rejection_cases':['unknown_page','unknown_slot','unknown_inventory']}
+                if source: cached['dataset'] = source
+                report.write_text(json.dumps(cached),encoding='utf-8')
+                with self.subTest(source=source), \
+                     patch('vision.VisionProfile',return_value=profile), \
+                     patch('ake.validate',return_value={'errors':['source recheck failed']}) as recheck, \
+                     patch('windowing.find_unique') as find_window, \
+                     patch('sys.stdout',new_callable=StringIO) as output:
+                    code = main(['run','--live','--profile','unused.json','--qualification',str(report)])
+                self.assertEqual(code,2)
+                self.assertEqual(json.loads(output.getvalue())['event'],'live_blocked')
+                find_window.assert_not_called()
+                if source: recheck.assert_called_once_with(profile,report.parent/source)
+                else: recheck.assert_not_called()
 
     def test_qualification_requires_correct_rejection_examples(self):
         # Semantic verifier fixture, not evidence that real screenshot recognition passed.
@@ -144,6 +191,27 @@ class VisionTests(unittest.TestCase):
                     with self.subTest(misrecognized_field=field):
                         self.assertFalse(report['passed'])
                         self.assertTrue(any(field+' mismatch' in error for error in report['errors']))
+                samples = positive+rejected
+                predictions[:] = samples
+                check(samples)
+                duplicate = json.loads(dataset.read_text(encoding='utf-8').splitlines()[0])
+                duplicate['image'] = './0'
+                with dataset.open('a',encoding='utf-8') as file:
+                    file.write('\n'+json.dumps(duplicate))
+                report = validate(Profile(),dataset)
+                self.assertFalse(report['passed'])
+                self.assertEqual(report['frames'],len(samples))
+                self.assertTrue(any('repeated validation image' in error for error in report['errors']))
+                for row,button,missing_flow in ((0,0,'single-draw'),(1,1,'early-abandon'),(2,2,'early-abandon')):
+                    samples = positive+rejected
+                    buttons = list(samples[row].buttons)
+                    buttons[button] = 'disabled'
+                    samples[row] = replace(samples[row],buttons=tuple(buttons))
+                    predictions[:] = samples
+                    report = check(samples)
+                    with self.subTest(unavailable_flow_button=(row,button)):
+                        self.assertFalse(report['passed'])
+                        self.assertTrue(any(missing_flow in error for error in report['errors']))
 
     def test_chinese_absolute_image_path(self):
         with TemporaryDirectory() as folder:

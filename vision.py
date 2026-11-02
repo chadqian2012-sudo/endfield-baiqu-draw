@@ -28,7 +28,7 @@ def classify(image, templates, thresholds, minimum_margin):
     Image and template dimensions must match exactly. This deliberately does not
     infer coordinates, rescale screenshots, or invent classification thresholds.
     """
-    if image is None or image.ndim != 2 or image.size == 0 or not templates:
+    if image is None or image.ndim != 2 or image.size == 0 or not templates or np.std(image) < 1:
         return Match(None, None, None)
     if minimum_margin is None or not 0 < minimum_margin <= 2:
         return Match(None, None, None)
@@ -38,7 +38,7 @@ def classify(image, templates, thresholds, minimum_margin):
             return Match(None, None, None)
         results = []
         for sample in samples:
-            if sample is None or sample.ndim != 2 or sample.shape != image.shape or np.std(sample) < 1 or np.std(image) < 1:
+            if sample is None or sample.ndim != 2 or sample.shape != image.shape or np.std(sample) < 1:
                 return Match(None, None, None)
             score = float(cv2.matchTemplate(image, sample, cv2.TM_CCOEFF_NORMED)[0,0])
             if not np.isfinite(score):
@@ -122,8 +122,8 @@ class VisionProfile:
         self.path = Path(path).resolve()
         self.config = json.loads(self.path.read_text(encoding='utf-8-sig'))
         self.size = tuple(self.config['frame_size'])
-        if len(self.size) != 2 or any(type(n) is not int or n <= 0 for n in self.size):
-            raise ValueError('invalid frame_size')
+        self.regions = self.config.get('regions', {})
+        self.check_regions(self.size,self.regions)
         self.groups = {}
         for name, data in self.config.get('groups', {}).items():
             if name not in self.CLASSES:
@@ -133,17 +133,14 @@ class VisionProfile:
                 if label not in self.CLASSES[name]:
                     raise ValueError('unknown class: '+name+'/'+label)
                 bank[label] = [self.image(p) for p in paths]
+                if name == 'cards' and 'slots' in self.regions:
+                    shape = tuple(reversed(self.regions['slots'][0][2:]))
+                    if any(image.shape != shape for image in bank[label]):
+                        raise ValueError('cards template dimensions differ from slot regions')
             self.groups[name] = (bank, data.get('thresholds', {}), data.get('margin'))
-        self.regions = self.config.get('regions', {})
-        for name, rois in self.regions.items():
-            if name in ('slots','inventory'):
-                if len(rois) != 5: raise ValueError(name+' must contain five regions')
-                for roi in rois: self.check_region(roi)
-            else:
-                self.check_region(rois)
         self.anchors = {}
         for name, data in self.config.get('anchors', {}).items():
-            self.check_region(data['region'])
+            self.check_region(self.size,data['region'])
             sample = self.image(data['template'])
             if sample.shape != (data['region'][3],data['region'][2]) or np.std(sample) < 1:
                 raise ValueError('invalid anchor: '+name)
@@ -156,11 +153,25 @@ class VisionProfile:
         if image is None: raise ValueError('cannot read template: '+str(path))
         return image
 
-    def check_region(self, roi):
+    @staticmethod
+    def check_region(size, roi):
         if (len(roi) != 4 or any(type(n) is not int for n in roi) or
             min(roi[:2]) < 0 or min(roi[2:]) <= 0 or
-            roi[0]+roi[2] > self.size[0] or roi[1]+roi[3] > self.size[1]):
+            roi[0]+roi[2] > size[0] or roi[1]+roi[3] > size[1]):
             raise ValueError('region outside calibrated frame')
+
+    @staticmethod
+    def check_regions(size, regions):
+        if len(size) != 2 or any(type(n) is not int or n <= 0 for n in size):
+            raise ValueError('invalid frame_size')
+        for name, rois in regions.items():
+            if name in ('slots','inventory'):
+                if len(rois) != 5: raise ValueError(name+' must contain five regions')
+                for roi in rois: VisionProfile.check_region(size,roi)
+                if name == 'slots' and any(tuple(roi[2:]) != tuple(rois[0][2:]) for roi in rois[1:]):
+                    raise ValueError('slot regions must have the same width and height')
+            else:
+                VisionProfile.check_region(size,rois)
 
     @staticmethod
     def crop(gray, roi):
