@@ -115,7 +115,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
         emit({'event':'paused','reason':reason})
 
     def handle_keys():
-        nonlocal cycle_clean,paused_started,pause_total,reason
+        nonlocal cycle_clean,cycle_started,paused_started,pause_total,reason
         pressed = keys() if keys else []
         if 0x78 in pressed:
             tracker.stop()
@@ -125,6 +125,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             cycle_clean = False
             if tracker.paused:
                 if tracker.resume():
+                    cycle_started = now[0]
                     if paused_started is not None:
                         pause_total += now[0]-paused_started
                         paused_started = None
@@ -175,6 +176,11 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 pause(reason)
                 if save: save(image,reason)
                 break
+            if (mode == 'live' and not tracker.paused and not tracker.pending and not tracker.candidate
+                    and cycle_started is not None and stamp-cycle_started >= tracker.timeout):
+                pause('observation or action readiness timed out')
+                if save: save(image,'observation or action readiness timed out')
+                continue
             if stable_obs is None:
                 if mode == 'live' and not tracker.candidate and tracker.check_timeout():
                     pause(tracker.error)
@@ -208,21 +214,22 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             if tracker.pending:
                 _,action,_ = tracker.pending
                 dialog = obs.page == 'abandon_dialog' and obs.buttons[2] == 'enabled'
-                if tracker.reconcile(obs,expected_abandon_dialog=dialog):
-                    emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
-                    if action == Action.DRAW:
-                        counters['cards_confirmed'] += 1
-                        timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
-                        last_hand = obs
-                    elif action == Action.CONFIRM:
-                        counters['restarts_completed'] += 1
-                        timings.add('restart',stamp-reset_started,uninterrupted=cycle_clean)
-                        last_hand = obs
-                        new_attempt()
-                elif tracker.check_timeout():
-                    pause(tracker.error)
-                    if save: save(image,tracker.error)
-                continue
+                if not tracker.reconcile(obs,expected_abandon_dialog=dialog):
+                    if tracker.check_timeout():
+                        pause(tracker.error)
+                        if save: save(image,tracker.error)
+                    continue
+                emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
+                if action == Action.DRAW:
+                    counters['cards_confirmed'] += 1
+                    timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
+                    last_hand = obs
+                elif action == Action.CONFIRM:
+                    counters['restarts_completed'] += 1
+                    timings.add('restart',stamp-reset_started,uninterrupted=cycle_clean)
+                    last_hand = obs
+                    new_attempt()
+                cycle_started = stamp
             if tracker.paused or not entered: continue
             if tracker.phase == 'dialog':
                 if obs.page != 'abandon_dialog' or obs.buttons[2] != 'enabled':
@@ -238,9 +245,9 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 if obs.buttons[0 if action == Action.DRAW else 1] != 'enabled': continue
             handle_keys()
             if tracker.paused or tracker.terminated or time.monotonic()-stamp > .5: continue
-            cycle_started = stamp
+            if not cycle_clean: cycle_started = stamp
             if action == Action.ABANDON:
-                reset_started = stamp
+                reset_started = cycle_started
                 cycle_clean = True
             elif action == Action.DRAW:
                 cycle_clean = True
