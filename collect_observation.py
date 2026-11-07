@@ -31,15 +31,15 @@ def main():
     outdir = Path('captures') / datetime.now().strftime('%Y%m%d-%H%M%S')
     outdir.mkdir(parents=True, exist_ok=False)
     writer = cv2.VideoWriter(str(outdir / 'observation.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), args.fps, (width, height))
-    if not writer.isOpened():
-        raise SystemExit('Video writer unavailable')
-    start = time.monotonic()
-    frames = 0
-    with (outdir / 'frames.csv').open('w', newline='', encoding='utf-8') as f, mss.mss() as capture:
-        log = csv.writer(f)
-        log.writerow(['frame', 'elapsed_seconds'])
-        print(f'READY {outdir} duration={args.seconds}s; input disabled', flush=True)
-        try:
+    try:
+        if not writer.isOpened():
+            raise SystemExit('Video writer unavailable')
+        start = time.monotonic()
+        frames = 0
+        with (outdir / 'frames.csv').open('w', newline='', encoding='utf-8') as f, mss.mss() as capture:
+            log = csv.writer(f)
+            log.writerow(['frame', 'elapsed_seconds'])
+            print(f'READY {outdir} duration={args.seconds}s; input disabled', flush=True)
             while time.monotonic() - start < args.seconds:
                 if (outdir / 'STOP').exists():
                     print('Stop marker detected', flush=True)
@@ -54,8 +54,8 @@ def main():
                     log.writerow([frames, f'{tick-start:.6f}'])
                     frames += 1
                 time.sleep(max(0, 1/args.fps - (time.monotonic()-tick)))
-        finally:
-            writer.release()
+    finally:
+        writer.release()
     print(f'DONE {frames} frames {outdir}', flush=True)
 
 if __name__ == '__main__': main()

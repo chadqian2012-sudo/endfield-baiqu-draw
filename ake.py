@@ -1,6 +1,7 @@
 """Windows CLI for calibrated observation, replay and qualified automation."""
 import argparse
 import csv
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime
 import hashlib
@@ -52,8 +53,8 @@ def evidence(profile, image, reason):
 def frames_from_recording(recording):
     import cv2
     video = cv2.VideoCapture(str(recording/'observation.mp4'))
-    if not video.isOpened(): raise ValueError('cannot open recording')
     try:
+        if not video.isOpened(): raise ValueError('cannot open recording')
         with (recording/'frames.csv').open(encoding='utf-8',newline='') as f:
             previous_time = None
             for index,row in enumerate(csv.DictReader(f)):
@@ -89,7 +90,8 @@ def frames_from_window(binding, seconds):
 def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     """Dry modes never call perform. The main thread owns stop and input order."""
     now = [0.0]
-    tracker = ActionTracker(clock=lambda:now[0])
+    clock = (lambda:now[0]) if mode == 'replay' else time.monotonic
+    tracker = ActionTracker(clock=clock)
     stabilizer = ObservationStabilizer()
     timings = Timings()
     last_hand = None
@@ -107,6 +109,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
 
     def pause(reason):
         nonlocal cycle_clean,paused_started
+        now[0] = clock()
         tracker.pause()
         stabilizer.pause(now[0])
         cycle_clean = False
@@ -115,7 +118,8 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
         emit({'event':'paused','reason':reason})
 
     def handle_keys():
-        nonlocal cycle_clean,paused_started,pause_total,reason
+        nonlocal cycle_clean,cycle_started,paused_started,pause_total,reason
+        now[0] = clock()
         pressed = keys() if keys else []
         if 0x78 in pressed:
             tracker.stop()
@@ -125,6 +129,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             cycle_clean = False
             if tracker.paused:
                 if tracker.resume():
+                    cycle_started = now[0]
                     if paused_started is not None:
                         pause_total += now[0]-paused_started
                         paused_started = None
@@ -146,35 +151,39 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     if mode == 'live': emit({'event':'armed','message':'F8 start/pause, F9 terminal stop'})
     try:
         for sequence,stamp,image,focused in frames:
-            now[0] = stamp
+            now[0] = stamp if mode == 'replay' else clock()
             handle_keys()
             if tracker.terminated: break
             if not focused:
                 stabilizer.frames.clear()
-                if mode == 'live': stabilizer.pause(stamp)
+                if mode == 'live': stabilizer.pause(now[0])
                 if mode == 'live' and not tracker.paused:
                     pause('focus lost; F8 required after reconciliation')
                 continue
             obs,quality = profile.read(image)
+            observed_at = now[0] = clock()
             last_observation = obs
-            stable_obs = stabilizer.add(Frame(sequence,stamp,obs),stamp if mode == 'replay' else time.monotonic())
+            stable_obs = stabilizer.add(Frame(sequence,stamp,obs),observed_at)
             tracker.candidate = stabilizer.candidate_since is not None
             decision = decide(stable_obs,timings.early_restart) if stable_obs is not None else Decision.WAIT
             if decision == Decision.SUCCESS:
                 if tracker.pending and tracker.pending[1] == Action.DRAW and draw_completed(tracker.pending[2],obs):
                     tracker.reconcile(obs)
                     counters['cards_confirmed'] += 1
-                    timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
+                    timings.add('draw',observed_at-cycle_started,uninterrupted=cycle_clean)
                 tracker.stop()
                 reason = 'success'
-                path = save(image,'success') if save else None
-                emit({'event':'success','observation':asdict(obs),'evidence':path})
                 break
-            if mode == 'live' and stabilizer.candidate_timed_out(stamp,tracker.timeout):
+            if mode == 'live' and stabilizer.candidate_timed_out(observed_at,tracker.timeout):
                 reason = 'suspected success; confirmation timeout'
                 pause(reason)
                 if save: save(image,reason)
                 break
+            if (mode == 'live' and not tracker.paused and not tracker.pending and not tracker.candidate
+                    and cycle_started is not None and observed_at-cycle_started >= tracker.timeout):
+                pause('observation or action readiness timed out')
+                if save: save(image,'observation or action readiness timed out')
+                continue
             if stable_obs is None:
                 if mode == 'live' and not tracker.candidate and tracker.check_timeout():
                     pause(tracker.error)
@@ -189,8 +198,8 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 if initial(obs):
                     entered = True
                     last_hand = obs
-                    active_started = stamp
-                    if mode == 'live' and tracker.paused: paused_started = stamp
+                    active_started = observed_at
+                    if mode == 'live' and tracker.paused: paused_started = observed_at
                     new_attempt()
             if mode != 'live':
                 semantic = (obs,decision,entered)
@@ -208,21 +217,22 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             if tracker.pending:
                 _,action,_ = tracker.pending
                 dialog = obs.page == 'abandon_dialog' and obs.buttons[2] == 'enabled'
-                if tracker.reconcile(obs,expected_abandon_dialog=dialog):
-                    emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
-                    if action == Action.DRAW:
-                        counters['cards_confirmed'] += 1
-                        timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
-                        last_hand = obs
-                    elif action == Action.CONFIRM:
-                        counters['restarts_completed'] += 1
-                        timings.add('restart',stamp-reset_started,uninterrupted=cycle_clean)
-                        last_hand = obs
-                        new_attempt()
-                elif tracker.check_timeout():
-                    pause(tracker.error)
-                    if save: save(image,tracker.error)
-                continue
+                if not tracker.reconcile(obs,expected_abandon_dialog=dialog):
+                    if tracker.check_timeout():
+                        pause(tracker.error)
+                        if save: save(image,tracker.error)
+                    continue
+                emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
+                if action == Action.DRAW:
+                    counters['cards_confirmed'] += 1
+                    timings.add('draw',observed_at-cycle_started,uninterrupted=cycle_clean)
+                    last_hand = obs
+                elif action == Action.CONFIRM:
+                    counters['restarts_completed'] += 1
+                    timings.add('restart',observed_at-reset_started,uninterrupted=cycle_clean)
+                    last_hand = obs
+                    new_attempt()
+                cycle_started = observed_at
             if tracker.paused or not entered: continue
             if tracker.phase == 'dialog':
                 if obs.page != 'abandon_dialog' or obs.buttons[2] != 'enabled':
@@ -238,9 +248,9 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 if obs.buttons[0 if action == Action.DRAW else 1] != 'enabled': continue
             handle_keys()
             if tracker.paused or tracker.terminated or time.monotonic()-stamp > .5: continue
-            cycle_started = stamp
+            if not cycle_clean: cycle_started = observed_at
             if action == Action.ABANDON:
-                reset_started = stamp
+                reset_started = cycle_started
                 cycle_clean = True
             elif action == Action.DRAW:
                 cycle_clean = True
@@ -265,11 +275,23 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
         reason = 'error: '+str(error)
         raise
     finally:
-        if paused_started is not None: pause_total += now[0]-paused_started
+        finished_at = now[0] if reason == 'success' else clock()
+        if paused_started is not None: pause_total += finished_at-paused_started
         result = {'event':'summary','termination_reason':reason,**counters,'timings':timings.summary(),
-                  'elapsed':None if active_started is None else now[0]-active_started,'paused_seconds':pause_total,
+                  'elapsed':None if active_started is None else finished_at-active_started,'paused_seconds':pause_total,
                   'last_observation':asdict(last_observation) if last_observation is not None else None,
                   'pending_action':{'id':tracker.pending[0],'action':tracker.pending[1].value} if tracker.pending else None}
+        if reason == 'success':
+            result['evidence'] = None
+            result['evidence_error'] = None
+            started = time.monotonic()
+            try:
+                if save: result['evidence'] = save(image,'success')
+            except (Exception,KeyboardInterrupt) as error:
+                result['evidence_error'] = 'Ctrl+C' if isinstance(error,KeyboardInterrupt) else str(error)
+                emit({'event':'evidence_error','reason':result['evidence_error']})
+            result['evidence_seconds'] = time.monotonic()-started if save else None
+            emit({'event':'success','observation':asdict(last_observation),'evidence':result['evidence']})
         emit(result)
     return result
 
@@ -284,25 +306,57 @@ def validate(profile, dataset):
     history = []
     total = 0
     rejection_cases = set()
-    seen_images = set()
+    seen_sources = set()
+    recordings = {}
     training = set(profile.config.get('training_batches',[]))
     if not training: errors.append('profile must name training_batches')
-    with dataset.open(encoding='utf-8-sig') as f:
+
+    def compatible(obs, hands):
+        return obs.page == 'unknown' or (obs.page == 'hand' and obs.game_round in (None,1)
+                and all(value is None or any(value == hand.slots[i] for hand in hands)
+                        for i,value in enumerate(obs.slots))
+                and all(value is None or any(value == hand.inventory[i] for hand in hands)
+                        for i,value in enumerate(obs.inventory)))
+
+    with dataset.open(encoding='utf-8-sig') as f, ExitStack() as cleanup:
         for line_number,line in enumerate(f,1):
             row = json.loads(line)
-            source = (dataset.parent/row['image']).resolve()
-            if source in seen_images:
-                errors.append(f'row {line_number}: repeated validation image')
+            if ('image' in row) == ('recording' in row):
+                raise ValueError('validation row requires exactly one image or recording source')
+            recording = (dataset.parent/row['recording']).resolve() if 'recording' in row else None
+            sequence = row.get('frame') if recording is not None else None
+            if recording is not None and (type(sequence) is not int or sequence < 0):
+                errors.append(f'row {line_number}: invalid validation frame index')
                 continue
-            seen_images.add(source)
-            total += 1
+            source = (recording,sequence) if recording is not None else (dataset.parent/row['image']).resolve()
+            if source in seen_sources:
+                errors.append(f'row {line_number}: repeated validation image or frame')
+                continue
+            seen_sources.add(source)
             if not row.get('batch') or row['batch'] in training:
                 errors.append(f'row {line_number}: missing or overlapping batch')
             if row.get('source') != 'real':
                 errors.append(f'row {line_number}: real-client evidence required for live qualification')
-            image = read_image(source,cv2.IMREAD_COLOR)
-            if image is None: raise ValueError('missing validation image')
-            actual,_ = profile.read(image)
+            if recording is not None:
+                if recording not in recordings:
+                    recordings[recording] = (frames_from_recording(recording),[])
+                    cleanup.callback(recordings[recording][0].close)
+                frames,trace = recordings[recording]
+                for frame in frames:
+                    trace.append(profile.read(frame[2])[0])
+                    if frame[0] >= sequence: break
+                else:
+                    errors.append(f'row {line_number}: missing or out-of-order recording frame')
+                    continue
+                if frame[0] != sequence:
+                    errors.append(f'row {line_number}: missing or out-of-order recording frame')
+                    continue
+                actual = trace[-1]
+            else:
+                image = read_image(source,cv2.IMREAD_COLOR)
+                if image is None: raise ValueError('missing validation image')
+                actual,_ = profile.read(image)
+            total += 1
             expected = row['expected']
             if set(expected) != {'slots','inventory','game_round','page','buttons'}:
                 errors.append(f'row {line_number}: incomplete annotation')
@@ -322,7 +376,7 @@ def validate(profile, dataset):
                 count['correct' if predicted == label else 'rejected' if predicted is None else 'wrong'] += 1
             obs = Observation(tuple(expected['slots']),tuple(expected['inventory']),expected['game_round'],
                               page=expected['page'],buttons=tuple(expected['buttons']))
-            history.append((row.get('batch'),obs))
+            history.append((row.get('batch'),recording,sequence,obs))
             if obs.page == 'unknown': rejection_cases.add('unknown_page')
             if obs.page == 'hand':
                 if None in obs.slots: rejection_cases.add('unknown_slot')
@@ -332,11 +386,20 @@ def validate(profile, dataset):
                 if obs.game_round is not None: coverage['round'].add(str(obs.game_round))
             for i,name in enumerate(('draw','abandon','confirm')):
                 if obs.buttons[i] is not None: coverage[name].add(obs.buttons[i])
-    early_reset = any(ba == bb == bc and valid_observation(a) and 0 < sum(v != 0 for v in a.slots) < 5
+        for frames,_ in recordings.values():
+            for _ in frames: pass
+    early_reset = any(ra is not None and ra == rb == rc and sa < sb < sc and ba == bb == bc
+                      and valid_observation(a) and 0 < sum(v != 0 for v in a.slots) < 5
                       and a.buttons[1] == 'enabled' and b.page == 'abandon_dialog'
                       and b.buttons[2] == 'enabled' and initial(c)
-                      for (ba,a),(bb,b),(bc,c) in zip(history,history[1:],history[2:]))
-    single_draw = any(ba == bb and a.buttons[0] == 'enabled' and draw_completed(a,b) for (ba,a),(bb,b) in zip(history,history[1:]))
+                      and all(compatible(obs,(a,)) for obs in recordings[ra][1][sa:sb])
+                      and all(obs.page == 'abandon_dialog' or compatible(obs,(a,c))
+                              for obs in recordings[ra][1][sb:sc+1])
+                      for (ba,ra,sa,a),(bb,rb,sb,b),(bc,rc,sc,c) in zip(history,history[1:],history[2:]))
+    single_draw = any(ra is not None and ra == rb and sa < sb and ba == bb
+                      and a.buttons[0] == 'enabled' and draw_completed(a,b)
+                      and all(compatible(obs,(a,b)) for obs in recordings[ra][1][sa:sb+1])
+                      for (ba,ra,sa,a),(bb,rb,sb,b) in zip(history,history[1:]))
     for name,classes in profile.CLASSES.items():
         missing = classes-coverage[name]
         if missing: errors.append(name+': validation missing '+','.join(sorted(missing)))
@@ -432,7 +495,7 @@ def main(argv=None):
                 cv2.destroyAllWindows()
             config['window'] = asdict(binding)
             VisionProfile.check_regions(config['frame_size'],config['regions'])
-            args.output.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
+            VisionProfile.save_config(args.output,config)
             dump({'calibration':str(args.output),'issues':VisionProfile(args.output).issues()})
             return 0
         profile = VisionProfile(args.layout)
@@ -444,7 +507,7 @@ def main(argv=None):
         for anchor in config.get('anchors',{}).values():
             anchor['template'] = str((profile.path.parent/anchor['template']).resolve())
         config['window'] = asdict(binding)
-        args.output.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
+        VisionProfile.save_config(args.output,config)
         dump({'calibration':str(args.output),'issues':profile.issues()})
         return 0
     profile = VisionProfile(args.profile)
@@ -520,12 +583,8 @@ def main(argv=None):
             for frame in frames:
                 if frame[2] is not None: last_image = frame[2]
                 yield frame
-        drive(profile,remember(),mode=mode,emit=emit,keys=keys.poll if keys else None,
+        result = drive(profile,remember(),mode=mode,emit=emit,keys=keys.poll if keys else None,
                         perform=perform,save=(lambda image,reason:evidence(profile,image,reason)) if live else None)
-        if live:
-            import winsound
-            winsound.MessageBeep()
-        return 0
     except KeyboardInterrupt:
         dump({'event':'stopped','reason':'Ctrl+C'})
         return 0
@@ -535,6 +594,17 @@ def main(argv=None):
             try: dump({'evidence':evidence(profile,last_image,str(error))})
             except Exception as save_error: dump({'evidence_error':str(save_error)})
         return 1
+    else:
+        if live:
+            started = time.monotonic()
+            try:
+                import winsound
+                winsound.MessageBeep()
+            except Exception as error:
+                emit({'event':'notification_error','reason':str(error),'elapsed':time.monotonic()-started})
+                return 1
+            emit({'event':'notification','elapsed':time.monotonic()-started})
+        return 1 if result.get('evidence_error') is not None else 0
     finally:
         if keys: keys.close()
         if handler: handler.close()
@@ -542,6 +612,9 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ValueError,OSError,KeyError) as error:
+    except KeyboardInterrupt:
+        dump({'event':'stopped','reason':'Ctrl+C'})
+        sys.exit(0)
+    except Exception as error:
         dump({'event':'error','reason':str(error)})
         sys.exit(1)

@@ -1,4 +1,5 @@
 import unittest
+import time
 from unittest.mock import Mock, patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -26,6 +27,12 @@ class SafetyTests(unittest.TestCase):
             self.assertIs(frames[0][2],images[0])
             self.assertIs(frames[1][2],images[1])
             video.release.assert_called_once()
+            video.reset_mock()
+            video.isOpened.return_value = False
+            with patch('cv2.VideoCapture',return_value=video), self.assertRaisesRegex(ValueError,'cannot open recording'):
+                list(frames_from_recording(recording))
+            video.release.assert_called_once()
+            video.read.assert_not_called()
 
     def test_recording_rejects_invalid_timeline_or_frame_count(self):
         cases = [('0,0\n2,0.2\n',2), ('0,0.2\n1,0.2\n',2),
@@ -58,10 +65,14 @@ class SafetyTests(unittest.TestCase):
         api.SendInput.assert_not_called()
 
     def run_stream(self, observations, mode='live', stop_after_click=False,
-                   stop_at_submission=False, step=.12, save=None, pause_at=None):
+                   stop_at_submission=False, step=.12, save=None, pause_at=None,
+                   sent_times=None, stop_after_confirmation=False, resume_at=None,
+                   read_seconds=None, save_seconds=0):
         class Profile:
             regions = {'draw':[0,0,1,1],'abandon':[0,0,1,1],'confirm':[0,0,1,1]}
-            def read(self, image): return image,{}
+            def read(self, image):
+                if read_seconds: now[0] += read_seconds(image)
+                return image,{}
         now = [0.0]
         events,clicks = [],[]
         def frames():
@@ -71,7 +82,7 @@ class SafetyTests(unittest.TestCase):
         started = [False]
         stopped = [False]
         def keys():
-            nonlocal pause_at
+            nonlocal pause_at,resume_at
             if not started[0]:
                 started[0] = True
                 return [0x77]
@@ -80,18 +91,28 @@ class SafetyTests(unittest.TestCase):
             if stop_after_click and clicks and not stopped[0]:
                 stopped[0] = True
                 return [0x78]
+            if stop_after_confirmation and not stopped[0] and any(e['event']=='action_confirmed' for e in events):
+                stopped[0] = True
+                return [0x78]
             if pause_at is not None and now[0] >= pause_at:
                 pause_at = None
+                return [0x77]
+            if resume_at is not None and now[0] >= resume_at:
+                resume_at = None
                 return [0x77]
             return []
         def perform(region, permitted):
             if stop_at_submission: stopped[0] = True
             if not permitted(): return False
             clicks.append(region)
+            if sent_times is not None: sent_times.append(now[0])
             return True
+        def persist(image,reason):
+            now[0] += save_seconds
+            return save(image,reason)
         with patch('ake.time.monotonic',side_effect=lambda:now[0]):
             summary = drive(Profile(),frames(),mode=mode,emit=events.append,
-                            keys=keys if mode=='live' else None,perform=perform,save=save)
+                            keys=keys if mode=='live' else None,perform=perform,save=persist if save else None)
         self.assertIs(events[-1],summary)
         self.assertEqual(sum(e['event']=='summary' for e in events),1)
         return events[:-1],clicks,summary
@@ -143,6 +164,133 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(summary['draw_clicks_sent'],4)
         self.assertEqual(summary['cards_confirmed'],4)
         self.assertEqual(events[-1]['event'],'success')
+
+    def test_confirmed_draw_continues_on_the_same_stable_observation(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        five = Observation(FIVE.slots,FIVE.inventory,1,buttons=('enabled','enabled',None))
+        sent = []
+        _,clicks,summary = self.run_stream([empty]*3+[five]*3,step=.125,sent_times=sent)
+        self.assertEqual(sent,[.25,.625])
+        self.assertEqual(len(clicks),2)
+        self.assertEqual(summary['cards_confirmed'],1)
+        self.assertEqual(summary['timings']['draw']['mean'],.375)
+
+    def test_cycle_timing_uses_completed_observations_instead_of_capture_stamps(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        five = Observation(FIVE.slots,FIVE.inventory,1,buttons=('enabled','enabled',None))
+        snapshots = [empty]*3+[five]*3
+        for before,after,expected in ((.02,.2,1.08),(.2,.02,.72)):
+            with self.subTest(read_seconds=(before,after)):
+                sent = []
+                _,clicks,summary = self.run_stream(snapshots,step=.3,sent_times=sent,
+                    read_seconds=lambda obs:before if obs == empty else after)
+                self.assertEqual(len(clicks),2)
+                self.assertAlmostEqual(sent[1]-sent[0],expected)
+                self.assertAlmostEqual(summary['timings']['draw']['mean'],expected)
+                self.assertAlmostEqual(summary['elapsed'],expected)
+        _,clicks,summary = self.run_stream(snapshots,mode='replay',step=.3,
+            read_seconds=lambda obs:.02 if obs == empty else .2)
+        self.assertEqual(clicks,[])
+        self.assertAlmostEqual(summary['elapsed'],.9)
+
+    def test_success_evidence_time_and_failures_preserve_terminal_result(self):
+        snapshots = []
+        for k in range(5):
+            snapshots.extend([Observation(tuple([5]*k+[0]*(5-k)),(6,6,6,6,10-k),1,
+                                          buttons=('enabled','enabled',None))]*3)
+        for error in (None,OSError('disk full'),KeyboardInterrupt()):
+            with self.subTest(save_error=type(error).__name__):
+                save = Mock(return_value='fixture-evidence',side_effect=error)
+                events,clicks,summary = self.run_stream(snapshots,step=.3,save=save,
+                    save_seconds=2,read_seconds=lambda _: .02)
+                self.assertEqual(summary['termination_reason'],'success')
+                self.assertEqual(len(clicks),4)
+                self.assertEqual(summary['cards_confirmed'],4)
+                self.assertAlmostEqual(summary['elapsed'],3.6)
+                self.assertAlmostEqual(summary['evidence_seconds'],2)
+                save.assert_called_once()
+                successes = [event for event in events if event['event']=='success']
+                self.assertEqual(len(successes),1)
+                if error is None:
+                    self.assertIsNone(summary['evidence_error'])
+                    self.assertEqual(successes[0]['evidence'],'fixture-evidence')
+                else:
+                    self.assertIsNotNone(summary['evidence_error'])
+                    self.assertIsNone(successes[0]['evidence'])
+
+    def test_confirmed_dialog_and_reset_continue_without_unmeasured_gaps(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        one = Observation((1,0,0,0,0),(5,6,6,6,10),1,buttons=('enabled','enabled',None))
+        failed = Observation((1,2,0,0,0),(5,5,6,6,10),1,buttons=('enabled','enabled',None))
+        dialog = Observation((None,)*5,(None,)*5,None,page='abandon_dialog',buttons=(None,None,'enabled'))
+        draw_wait = Observation(one.slots,one.inventory,1,buttons=('disabled','enabled',None))
+        reset_wait = Observation(failed.slots,failed.inventory,1,buttons=('enabled','disabled',None))
+        cases = [('ready',(empty,one,failed,dialog,empty),[.25,.625,1,1.375,1.75],.75,.75),
+                 ('draw wait',(empty,draw_wait,one,failed,dialog,empty),[.25,1,1.375,1.75,2.125],1.125,.75),
+                 ('reset wait',(empty,one,reset_wait,failed,dialog,empty),[.25,.625,1.375,1.75,2.125],.75,1.125)]
+        for name,states,expected_times,draw_time,reset_time in cases:
+            with self.subTest(readiness=name):
+                snapshots = [obs for obs in states for _ in range(3)]
+                sent = []
+                events,_,summary = self.run_stream(snapshots,step=.125,sent_times=sent)
+                self.assertEqual(sent,expected_times)
+                self.assertEqual([e['action'] for e in events if e['event']=='input_sent'],
+                                 ['draw','draw','abandon','confirm','draw'])
+                self.assertEqual(summary['restarts_completed'],1)
+                draw,reset = summary['timings']['draw'],summary['timings']['restart']
+                self.assertEqual(draw['count'],2)
+                self.assertEqual(reset['count'],1)
+                self.assertEqual(draw['mean']*draw['count'],draw_time)
+                self.assertEqual(reset['mean']*reset['count'],reset_time)
+                self.assertEqual(draw_time+reset_time,summary['elapsed'])
+
+    def test_f9_after_confirmation_prevents_same_frame_followup(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        five = Observation(FIVE.slots,FIVE.inventory,1,buttons=('enabled','enabled',None))
+        events,clicks,summary = self.run_stream([empty]*3+[five]*3,step=.125,stop_after_confirmation=True)
+        self.assertEqual(len(clicks),1)
+        self.assertEqual(summary['cards_confirmed'],1)
+        self.assertEqual(summary['termination_reason'],'F9')
+        self.assertEqual(events[-1],{'event':'stopped','reason':'F9'})
+
+    def test_readiness_timeout_covers_unknown_unstable_and_disabled_states(self):
+        unknown = Observation((None,)*5,(None,)*5,None,page='unknown')
+        disabled = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('disabled','disabled',None))
+        incomplete = Observation((None,0,0,0,0),EMPTY.inventory,1,buttons=disabled.buttons)
+        for name,snapshots in [('unknown',[unknown]*90),('unstable',[incomplete,disabled]*45),('disabled',[disabled]*90)]:
+            with self.subTest(state=name):
+                saved_at = []
+                save = Mock(side_effect=lambda *_:saved_at.append(time.monotonic()))
+                events,clicks,_ = self.run_stream(snapshots,step=.125,save=save)
+                self.assertEqual(clicks,[])
+                self.assertEqual([e['reason'] for e in events if e['event']=='paused'],
+                                 ['observation or action readiness timed out'])
+                self.assertEqual(saved_at,[10])
+                save.assert_called_once()
+
+    def test_readiness_deadline_restarts_after_explicit_pause_and_resume(self):
+        unknown = Observation((None,)*5,(None,)*5,None,page='unknown')
+        saved_at = []
+        save = Mock(side_effect=lambda *_:saved_at.append(time.monotonic()))
+        events,clicks,_ = self.run_stream([unknown]*250,step=.125,save=save,pause_at=3,resume_at=20)
+        self.assertEqual(clicks,[])
+        self.assertEqual([e['reason'] for e in events if e['event']=='paused'],
+                         ['F8','observation or action readiness timed out'])
+        self.assertEqual(saved_at,[30])
+        save.assert_called_once()
+
+    def test_confirmed_draw_refreshes_readiness_deadline_for_disabled_button(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        disabled = Observation(FIVE.slots,FIVE.inventory,1,buttons=('disabled','enabled',None))
+        saved_at = []
+        save = Mock(side_effect=lambda *_:saved_at.append(time.monotonic()))
+        events,clicks,summary = self.run_stream([empty]*3+[disabled]*100,step=.125,save=save)
+        self.assertEqual(len(clicks),1)
+        self.assertEqual(summary['cards_confirmed'],1)
+        self.assertEqual([e['reason'] for e in events if e['event']=='paused'],
+                         ['observation or action readiness timed out'])
+        self.assertEqual(saved_at,[10.625])
+        save.assert_called_once()
 
     def test_dry_run_does_not_fake_execution(self):
         events,clicks,summary = self.run_stream([EMPTY]*40,mode='dry-run')

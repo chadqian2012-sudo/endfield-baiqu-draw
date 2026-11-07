@@ -6,4 +6,5 @@ dist/
 logs/
 captures/
 calibration.local.json
+.ake-config-*.tmp
 *.spec

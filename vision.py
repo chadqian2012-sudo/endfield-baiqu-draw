@@ -1,8 +1,10 @@
 """Conservative grayscale template classification; templates must be calibrated externally."""
 from dataclasses import dataclass
+from copy import deepcopy
 import cv2
 import numpy as np
 import json
+import os
 from pathlib import Path
 from dataclasses import asdict
 from ake_core import Observation
@@ -154,6 +156,21 @@ class VisionProfile:
         return image
 
     @staticmethod
+    def save_config(path, config):
+        text = json.dumps(config,ensure_ascii=False,indent=2)
+        path = Path(path).resolve()
+        temporary = path.with_name('.ake-config-'+uuid4().hex+'.tmp')
+        stream = temporary.open('x',encoding='utf-8')
+        try:
+            with stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
     def check_region(size, roi):
         if (len(roi) != 4 or any(type(n) is not int for n in roi) or
             min(roi[:2]) < 0 or min(roi[2:]) <= 0 or
@@ -223,16 +240,18 @@ class VisionProfile:
         assets.mkdir(parents=True,exist_ok=True)
         file = assets/(uuid4().hex+'.png')
         write_image(file,image)
+        config = deepcopy(self.config)
         if group in ('hand','abandon_dialog'):
-            self.config.setdefault('anchors',{})[group] = {'region':roi,'template':str(file),'threshold':score}
+            config.setdefault('anchors',{})[group] = {'region':roi,'template':str(file),'threshold':score}
         else:
-            data = self.config.setdefault('groups',{}).setdefault(group,{'templates':{},'thresholds':{}})
+            data = config.setdefault('groups',{}).setdefault(group,{'templates':{},'thresholds':{}})
             data['templates'].setdefault(label,[]).append(str(file))
             data['thresholds'][label] = score
             data['margin'] = margin
-        batches = self.config.setdefault('training_batches',[])
+        batches = config.setdefault('training_batches',[])
         if batch not in batches: batches.append(batch)
-        self.path.write_text(json.dumps(self.config,ensure_ascii=False,indent=2),encoding='utf-8')
+        self.save_config(self.path,config)
+        self.config = config
 
     def read(self, frame):
         if frame.shape[:2] != (self.size[1],self.size[0]):
