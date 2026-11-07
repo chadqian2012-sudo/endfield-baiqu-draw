@@ -96,6 +96,14 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     reason = 'source ended'
     counters = {'draw_clicks_sent':0,'cards_confirmed':0,'attempts_confirmed':0,'restarts_completed':0}
 
+    def pause(reason):
+        nonlocal cycle_clean,paused_started
+        tracker.pause()
+        cycle_clean = False
+        if paused_started is None and active_started is not None:
+            paused_started = now[0]
+        emit({'event':'paused','reason':reason})
+
     def handle_keys():
         nonlocal cycle_clean,paused_started,pause_total,reason
         pressed = keys() if keys else []
@@ -115,9 +123,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 else:
                     emit({'event':'paused','reason':'pending action or success candidate requires reconciliation'})
             else:
-                tracker.pause()
-                paused_started = now[0]
-                emit({'event':'paused','reason':'F8'})
+                pause('F8')
 
     def new_attempt():
         nonlocal last_policy
@@ -135,17 +141,14 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
         if not focused:
             stabilizer.frames.clear()
             if mode == 'live' and not tracker.paused:
-                tracker.pause()
-                cycle_clean = False
-                paused_started = stamp
-                emit({'event':'paused','reason':'focus lost; F8 required after reconciliation'})
+                pause('focus lost; F8 required after reconciliation')
             continue
         obs,quality = profile.read(image)
         stable_obs = stabilizer.add(Frame(sequence,stamp,obs),stamp if mode == 'replay' else time.monotonic())
         tracker.candidate = stabilizer.candidate
         if stable_obs is None:
             if mode == 'live' and tracker.check_timeout():
-                emit({'event':'paused','reason':tracker.error})
+                pause(tracker.error)
                 if save: save(image,tracker.error)
             continue
         decision = decide(obs,timings.early_restart)
@@ -203,20 +206,18 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                     last_hand = obs
                     new_attempt()
             elif tracker.check_timeout():
-                emit({'event':'paused','reason':tracker.error})
+                pause(tracker.error)
                 if save: save(image,tracker.error)
             continue
         if tracker.paused or not entered: continue
         if tracker.phase == 'dialog':
             if obs.page != 'abandon_dialog' or obs.buttons[2] != 'enabled':
-                tracker.pause()
-                emit({'event':'paused','reason':'expected abandon dialog no longer aligned'})
+                pause('expected abandon dialog no longer aligned')
                 continue
             action,context,button = Action.CONFIRM,last_hand,'confirm'
         else:
             if (not valid_observation(obs) or obs.slots != last_hand.slots or obs.inventory != last_hand.inventory):
-                tracker.pause()
-                emit({'event':'paused','reason':'unexplained or unknown state; manual reconciliation required'})
+                pause('unexplained or unknown state; manual reconciliation required')
                 continue
             action = Action.DRAW if decision == Decision.DRAW else Action.ABANDON
             context,button = obs,'draw' if action == Action.DRAW else 'abandon'
@@ -229,16 +230,17 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             cycle_clean = True
         elif action == Action.DRAW:
             cycle_clean = True
-        emit({'event':'input_intent','action':action.value,'attempt':counters['attempts_confirmed'],
-              'observation':asdict(obs),'timings':timings.summary()})
         def permitted():
             handle_keys()
             return not tracker.paused and not tracker.terminated and not tracker.candidate and time.monotonic()-stamp <= .5
-        if not perform(profile.regions[button],permitted):
-            tracker.pause()
-            emit({'event':'input_cancelled','reason':'stop, pause, stale observation or focus change'})
+        def submit(action_id):
+            emit({'event':'input_intent','id':action_id,'action':action.value,
+                  'attempt':counters['attempts_confirmed'],'observation':asdict(obs),'timings':timings.summary()})
+            return perform(profile.regions[button],permitted)
+        action_id = tracker.send(action,context,submit,early_restart=timings.early_restart)
+        if action_id is None:
+            pause('input cancelled: stop, pause, stale observation or focus change')
             continue
-        action_id = tracker.sent(action,context,early_restart=timings.early_restart)
         if action == Action.DRAW: counters['draw_clicks_sent'] += 1
         emit({'event':'input_sent','id':action_id,'action':action.value})
     if paused_started is not None: pause_total += now[0]-paused_started

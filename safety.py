@@ -70,7 +70,6 @@ class ActionTracker:
         self.timeout = timeout
         self.clock = clock
         self.wait_started = None
-        self.wait_elapsed = 0.0
         self.error = None
 
     def resume(self):
@@ -80,9 +79,6 @@ class ActionTracker:
         return True
 
     def pause(self):
-        if not self.paused and self.pending is not None and self.wait_started is not None:
-            self.wait_elapsed += max(0.0, self.clock() - self.wait_started)
-            self.wait_started = None
         self.paused = True
 
     def stop(self):
@@ -96,7 +92,7 @@ class ActionTracker:
             if valid_observation(obs):
                 self.stop()
 
-    def sent(self, action, before, *, early_restart=False):
+    def send(self, action, before, submit, *, early_restart=False):
         if self.paused or self.terminated or self.candidate or self.pending is not None or not valid_observation(before):
             raise RuntimeError('input blocked')
         if decide(before) == Decision.SUCCESS:
@@ -113,13 +109,17 @@ class ActionTracker:
         self._next_id += 1
         self.pending = (action_id, action, before)
         self.wait_started = self.clock()
-        self.wait_elapsed = 0.0
+        # False guarantees no submission. An exception leaves the outcome pending.
+        if not submit(action_id):
+            self.pending = None
+            self.wait_started = None
+            return None
         return action_id
 
     def check_timeout(self):
         if self.pending is None or self.paused or self.wait_started is None:
             return False
-        if self.wait_elapsed + max(0.0, self.clock() - self.wait_started) < self.timeout:
+        if max(0.0, self.clock() - self.wait_started) < self.timeout:
             return False
         self.pause()
         self.error = 'action confirmation timed out'
@@ -136,7 +136,6 @@ class ActionTracker:
         if complete:
             self.pending = None
             self.wait_started = None
-            self.wait_elapsed = 0.0
             self.error = None
             if action == Action.ABANDON:
                 self.phase = 'dialog'
