@@ -92,7 +92,7 @@ class SafetyTests(unittest.TestCase):
     def run_stream(self, observations, mode='live', stop_after_click=False,
                    stop_at_submission=False, step=.12, save=None, pause_at=None,
                    sent_times=None, stop_after_confirmation=False, resume_at=None,
-                   read_seconds=None, save_seconds=0):
+                   read_seconds=None, save_seconds=0, stamps=None):
         class Profile:
             regions = {'draw':[0,0,1,1],'abandon':[0,0,1,1],'confirm':[0,0,1,1]}
             def read(self, image):
@@ -102,7 +102,7 @@ class SafetyTests(unittest.TestCase):
         events,clicks = [],[]
         def frames():
             for i,obs in enumerate(observations):
-                now[0] = i*step
+                now[0] = stamps[i] if stamps is not None else i*step
                 yield i,now[0],obs,True
         started = [False]
         stopped = [False]
@@ -366,6 +366,20 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(any(e['event']=='paused' for e in events))
         self.assertEqual(clicks,[])
         save.assert_called_once_with(success,'success')
+        snapshots = [Observation(tuple([5]*k+[0]*(5-k)),(6,6,6,6,10-k),1,
+                                 buttons=('enabled','enabled',None)) for k in range(4) for _ in range(3)]
+        prefix_stamps = [i*.125 for i in range(len(snapshots))]
+        for duration in (10,10.01):
+            with self.subTest(pending_draw_seconds=duration):
+                save = Mock()
+                stamps = prefix_stamps+[prefix_stamps[-1]+duration+delta for delta in (-.26,-.13,0)]
+                events,clicks,summary = self.run_stream(snapshots+[success]*3,stamps=stamps,save=save)
+                self.assertEqual(summary['termination_reason'],'success')
+                self.assertEqual(len(clicks),4)
+                self.assertEqual(summary['cards_confirmed'],4)
+                self.assertIsNone(summary['pending_action'])
+                self.assertFalse(any(e['event']=='paused' for e in events))
+                save.assert_called_once_with(success,'success')
 
     def test_f8_pause_freezes_candidate_deadline_with_draw_pending(self):
         snapshots = []
@@ -403,6 +417,39 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(clicks),1)
         self.assertEqual(sum(e['event']=='paused' for e in events),1)
         self.assertGreater(summary['paused_seconds'],8)
+
+    def test_first_stable_confirmation_at_deadline_pauses_before_followup(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        five = Observation(FIVE.slots,FIVE.inventory,1,buttons=('enabled','enabled',None))
+        one = Observation((1,0,0,0,0),(5,6,6,6,10),1,buttons=five.buttons)
+        failed = Observation((1,2,0,0,0),(5,5,6,6,10),1,buttons=five.buttons)
+        dialog = Observation((None,)*5,(None,)*5,None,page='abandon_dialog',buttons=(None,None,'enabled'))
+        for action,prefix,after,draw_samples in (
+                ('draw',[empty],five,0),
+                ('abandon',[empty,one,failed],dialog,2),
+                ('confirm',[empty,one,failed,dialog],empty,2)):
+            for duration in (9.99,10,10.01):
+                with self.subTest(action=action,duration=duration):
+                    snapshots = [obs for obs in prefix for _ in range(3)]
+                    stamps = [i*.125 for i in range(len(snapshots))]
+                    sent_at = stamps[-1]
+                    stamps += [sent_at+duration+delta for delta in (-.26,-.13,0,.125,.25)]
+                    save = Mock()
+                    events,clicks,summary = self.run_stream(snapshots+[after]*5,stamps=stamps,save=save)
+                    expired = duration >= 10
+                    self.assertEqual(len(clicks),len(prefix)+(not expired))
+                    pauses = [e for e in events if e['event']=='paused']
+                    self.assertEqual([e['reason'] for e in pauses],['action confirmation timed out'] if expired else [])
+                    self.assertEqual([e['action'] for e in events if e['event']=='action_confirmed'][-1],action)
+                    self.assertEqual(summary['cards_confirmed'],1 if action=='draw' else 2)
+                    self.assertEqual(summary['restarts_completed'],int(action=='confirm'))
+                    self.assertEqual(summary['timings']['draw']['count'],draw_samples+int(action=='draw' and not expired))
+                    self.assertEqual(summary['timings']['restart']['count'],int(action=='confirm' and not expired))
+                    if expired:
+                        self.assertIsNone(summary['pending_action'])
+                        save.assert_called_once_with(after,'action confirmation timed out')
+                    else:
+                        save.assert_not_called()
 
     def test_stability_requires_distinct_fresh_frames(self):
         frames = [Frame(1,0,EMPTY), Frame(2,.11,EMPTY), Frame(3,.22,EMPTY)]
