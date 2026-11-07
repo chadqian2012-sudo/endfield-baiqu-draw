@@ -284,27 +284,33 @@ def validate(profile, dataset):
     history = []
     total = 0
     rejection_cases = set()
+    seen_images = set()
     training = set(profile.config.get('training_batches',[]))
     if not training: errors.append('profile must name training_batches')
     with dataset.open(encoding='utf-8-sig') as f:
-        for line in f:
+        for line_number,line in enumerate(f,1):
             row = json.loads(line)
+            source = (dataset.parent/row['image']).resolve()
+            if source in seen_images:
+                errors.append(f'row {line_number}: repeated validation image')
+                continue
+            seen_images.add(source)
             total += 1
             if not row.get('batch') or row['batch'] in training:
-                errors.append(f'row {total}: missing or overlapping batch')
+                errors.append(f'row {line_number}: missing or overlapping batch')
             if row.get('source') != 'real':
-                errors.append(f'row {total}: real-client evidence required for live qualification')
-            image = read_image(dataset.parent/row['image'],cv2.IMREAD_COLOR)
+                errors.append(f'row {line_number}: real-client evidence required for live qualification')
+            image = read_image(source,cv2.IMREAD_COLOR)
             if image is None: raise ValueError('missing validation image')
             actual,_ = profile.read(image)
             expected = row['expected']
             if set(expected) != {'slots','inventory','game_round','page','buttons'}:
-                errors.append(f'row {total}: incomplete annotation')
+                errors.append(f'row {line_number}: incomplete annotation')
                 continue
             observed = asdict(actual)
             for key,value in expected.items():
                 if json.loads(json.dumps(observed[key])) != value:
-                    errors.append(f'row {total}: {key} mismatch')
+                    errors.append(f'row {line_number}: {key} mismatch')
             pairs = [('cards','empty' if v == 0 else str(v),actual.slots[i]) for i,v in enumerate(expected['slots']) if v is not None]
             pairs += [('stock_values',str(v),actual.inventory[i]) for i,v in enumerate(expected['inventory']) if v is not None]
             pairs += [('round',str(expected['game_round']),actual.game_round)] if expected['game_round'] is not None else []
@@ -327,9 +333,10 @@ def validate(profile, dataset):
             for i,name in enumerate(('draw','abandon','confirm')):
                 if obs.buttons[i] is not None: coverage[name].add(obs.buttons[i])
     early_reset = any(ba == bb == bc and valid_observation(a) and 0 < sum(v != 0 for v in a.slots) < 5
-                      and b.page == 'abandon_dialog' and initial(c)
+                      and a.buttons[1] == 'enabled' and b.page == 'abandon_dialog'
+                      and b.buttons[2] == 'enabled' and initial(c)
                       for (ba,a),(bb,b),(bc,c) in zip(history,history[1:],history[2:]))
-    single_draw = any(ba == bb and draw_completed(a,b) for (ba,a),(bb,b) in zip(history,history[1:]))
+    single_draw = any(ba == bb and a.buttons[0] == 'enabled' and draw_completed(a,b) for (ba,a),(bb,b) in zip(history,history[1:]))
     for name,classes in profile.CLASSES.items():
         missing = classes-coverage[name]
         if missing: errors.append(name+': validation missing '+','.join(sorted(missing)))
@@ -340,7 +347,7 @@ def validate(profile, dataset):
     errors.extend(profile.issues())
     return {'passed':not errors,'profile_sha256':fingerprint(profile),'frames':total,'errors':errors,
             'coverage':{name:sorted(values) for name,values in coverage.items()},'class_results':results,
-            'rejection_cases':sorted(rejection_cases)}
+            'rejection_cases':sorted(rejection_cases),'dataset':str(dataset.resolve())}
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
@@ -412,15 +419,19 @@ def main(argv=None):
                 for name,count in [('slots',5),('inventory',5),('round',1),('draw',1),('abandon',1),('confirm',1),('hand',1),('abandon_dialog',1)]:
                     regions = []
                     for i in range(count):
-                        title = f'{name} {i+1}: select region, ENTER accept, ESC cancel'
+                        selection = f'select top-left; fixed {regions[0][2]}x{regions[0][3]}' if name == 'slots' and regions else 'select region'
+                        title = f'{name} {i+1}: {selection}, ENTER accept, ESC cancel'
                         roi = tuple(map(int,cv2.selectROI(title,frame,showCrosshair=True)))
                         cv2.destroyAllWindows()
                         if min(roi[2:]) <= 0: raise ValueError('calibration cancelled')
+                        if name == 'slots' and regions:
+                            roi = (*roi[:2],*regions[0][2:])
                         regions.append(roi)
                     config['regions'][name] = regions if count == 5 else regions[0]
             finally:
                 cv2.destroyAllWindows()
             config['window'] = asdict(binding)
+            VisionProfile.check_regions(config['frame_size'],config['regions'])
             args.output.write_text(json.dumps(config,ensure_ascii=False,indent=2),encoding='utf-8')
             dump({'calibration':str(args.output),'issues':VisionProfile(args.output).issues()})
             return 0
@@ -474,10 +485,12 @@ def main(argv=None):
             problems.append('independent validation report required')
         else:
             report = json.loads(args.qualification.read_text(encoding='utf-8-sig'))
-            if report.get('passed') is not True or report.get('profile_sha256') != fingerprint(profile):
-                problems.append('validation failed or profile/templates changed')
-            if not REJECTION_CASES.issubset(report.get('rejection_cases',[])):
-                problems.append('validation report lacks rejection cases; rerun validate')
+            if not report.get('dataset'):
+                problems.append('validation report lacks source dataset; rerun validate')
+            else:
+                source = Path(report['dataset'])
+                if not source.is_absolute(): source = args.qualification.parent/source
+                problems = validate(profile,source)['errors']
         if problems:
             dump({'event':'live_blocked','reasons':problems})
             return 2
