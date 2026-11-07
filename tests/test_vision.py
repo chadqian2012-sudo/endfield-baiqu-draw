@@ -52,6 +52,9 @@ class VisionTests(unittest.TestCase):
             self.assertEqual(profile.match_group(frame,'cards',slots[0]).label,'1')
             profile.add_sample(frame,'cards','5',1,0,.9,.1,'second-slot')
             profile = VisionProfile(path)
+            saved = Path(profile.config['groups']['cards']['templates']['5'][-1])
+            self.assertFalse(saved.is_absolute())
+            self.assertTrue((root/saved).is_file())
             self.assertEqual(profile.match_group(frame,'cards',slots[0]).label,'1')
             self.assertEqual(profile.match_group(frame,'cards',slots[1]).label,'5')
 
@@ -67,23 +70,21 @@ class VisionTests(unittest.TestCase):
                 writer.isOpened.return_value = failure != 'unavailable'
                 writer.write.side_effect = lambda frame:frames.append(frame.copy())
                 capture = Mock()
-                capture.grab.return_value = source
+                capture.grab.return_value = source[:,:,:3].copy(),True
                 with patch('sys.argv',['collect_observation.py','--seconds','1','--fps','5']), \
                      patch('sys.stdout',new_callable=StringIO), \
                      patch('collect_observation.find_unique',return_value=binding), \
-                     patch('collect_observation.snapshot',return_value=binding), \
-                     patch('collect_observation.foreground_matches',return_value=True), \
                      patch('collect_observation.Path',return_value=root/'captures'), \
                      patch('collect_observation.cv2.VideoWriter',return_value=writer) as create_writer, \
-                     patch('collect_observation.mss.mss') as mss, \
+                     patch('collect_observation.WindowCapture') as capture_owner, \
                      patch.object(Path,'open',autospec=True,side_effect=real_open) as open_csv, \
                      patch('collect_observation.csv.writer',wraps=collect_observation.csv.writer) as csv_writer, \
                      patch('collect_observation.time.monotonic',side_effect=[0,0,.1,.2,1.1]), \
                      patch('collect_observation.time.sleep'):
-                    mss.return_value.__enter__.return_value = capture
+                    capture_owner.return_value.__enter__.return_value = capture
                     if failure == 'csv-open': open_csv.side_effect = OSError(failure)
-                    elif failure == 'mss-create': mss.side_effect = OSError(failure)
-                    elif failure == 'mss-enter': mss.return_value.__enter__.side_effect = OSError(failure)
+                    elif failure == 'mss-create': capture_owner.side_effect = OSError(failure)
+                    elif failure == 'mss-enter': capture_owner.return_value.__enter__.side_effect = OSError(failure)
                     elif failure == 'header-write': csv_writer.return_value = Mock(writerow=Mock(side_effect=OSError(failure)))
                     if failure:
                         with self.assertRaisesRegex(SystemExit if failure == 'unavailable' else OSError,failure):
@@ -96,7 +97,7 @@ class VisionTests(unittest.TestCase):
                     writer.write.assert_not_called()
                     capture.grab.assert_not_called()
                     continue
-                capture.grab.assert_called_once_with({'left':20,'top':30,'width':100,'height':100})
+                capture.grab.assert_called_once_with()
                 self.assertEqual(len(frames),1)
                 self.assertEqual(frames[0].shape,(100,100,3))
                 np.testing.assert_array_equal(frames[0][:95],source[:95,:,:3])
@@ -113,11 +114,11 @@ class VisionTests(unittest.TestCase):
                  patch('sys.argv',['collect_observation.py','--seconds','1']), \
                  patch('collect_observation.find_unique',return_value=Mock(client=(0,0,*size))), \
                  patch('collect_observation.cv2.VideoWriter') as create_writer, \
-                 patch('collect_observation.mss.mss') as mss:
+                 patch('collect_observation.WindowCapture') as capture_owner:
                 with self.assertRaisesRegex(SystemExit,'even client width and height'):
                     collect_observation.main()
                 create_writer.assert_not_called()
-                mss.assert_not_called()
+                capture_owner.assert_not_called()
 
     def test_uninformative_sample_preserves_existing_profile(self):
         with TemporaryDirectory() as folder:
@@ -268,7 +269,7 @@ class VisionTests(unittest.TestCase):
                      patch('ake.frames_from_window',return_value=frames()), \
                      patch('windowing.find_unique',return_value=binding), \
                      patch('windowing.Hotkeys') as hotkeys, \
-                     patch('windowing.click') as click, \
+                     patch('windowing.MouseExecutor') as executor, \
                      patch('ake.evidence',side_effect=save) as evidence, \
                      patch('ake.time.monotonic',side_effect=lambda:now[0]), \
                      patch('ake.dump',side_effect=events.append), \
@@ -285,7 +286,7 @@ class VisionTests(unittest.TestCase):
                 notification = next(e for e in events if e.get('event') in ('notification','notification_error'))
                 self.assertEqual(notification['event'],'notification_error' if failure == 'notification' else 'notification')
                 self.assertEqual(notification['elapsed'],.375)
-                click.assert_not_called()
+                executor.return_value.assert_not_called()
                 hotkeys.return_value.close.assert_called_once_with()
                 log.return_value.close.assert_called_once_with()
 
@@ -313,7 +314,7 @@ class VisionTests(unittest.TestCase):
                      patch('pathlib.Path.mkdir'), patch('ake.validate',return_value={'errors':[]}), \
                      patch('ake.StrictLog') as log, patch('ake.frames_from_window',return_value=frames()), \
                      patch('windowing.find_unique',return_value=binding), \
-                     patch('windowing.Hotkeys') as hotkeys, patch('windowing.click') as click, \
+                     patch('windowing.Hotkeys') as hotkeys, patch('windowing.MouseExecutor') as executor, \
                      patch('ake.evidence',return_value='fixture-evidence',
                            side_effect=OSError('disk full') if target=='evidence_error' else None), \
                      patch('ake.time.monotonic',side_effect=lambda:now[0]), \
@@ -328,7 +329,7 @@ class VisionTests(unittest.TestCase):
                 self.assertEqual(summaries[0]['termination_reason'],'success' if terminal else 'error: critical log write failed')
                 if terminal: self.assertIn('evidence_seconds',summaries[0])
                 if target=='input_intent': self.assertEqual(summaries[0]['pending_action'],{'id':1,'action':'draw'})
-                click.assert_not_called()
+                executor.return_value.assert_not_called()
                 hotkeys.return_value.close.assert_called_once_with()
                 log.return_value.close.assert_called_once_with()
 
@@ -478,6 +479,18 @@ class VisionTests(unittest.TestCase):
                 report = validate(Profile(),dataset)
                 recording_images[:] = original_images
                 self.assertTrue(report['passed'])
+                for trace, labelled, missing in [
+                        ([0,1,0,1,2,3],[0,3,4,5],'single-draw'),
+                        ([0,1,2,3,1,3],[0,1,2,5],'early-abandon'),
+                        ([0,1,2,3,2,3],[0,1,2,5],'early-abandon')]:
+                    with self.subTest(reversed_progress=trace):
+                        for i,frame in enumerate(labelled):
+                            rows[i]['frame'] = frame
+                        dataset.write_text('\n'.join(json.dumps(row) for row in rows),encoding='utf-8')
+                        recording_images[:] = [original_images[i] for i in trace]
+                        report = validate(Profile(),dataset)
+                        self.assertTrue(any(missing in error for error in report['errors']))
+                recording_images[:] = original_images
                 # Independent recording frames may have identical pixels after a full reset.
                 self.assertTrue(np.array_equal(recording_images[0],recording_images[3]))
                 reader.reset_mock()
@@ -513,6 +526,50 @@ class VisionTests(unittest.TestCase):
         self.assertIsNone(classify(a, templates, {}, .1).label)
         self.assertIsNone(classify(np.zeros((32,32),dtype=np.uint8), templates, {'a':.9,'b':.9}, .1).label)
         self.assertIsNone(recognize_card(a, {'1':[a],'5':[b]}, {'1':.9,'5':.9}, .1).label)
+
+    def test_cuda_failure_rechecks_same_frame_and_preserves_opencv_thresholds(self):
+        rng = np.random.default_rng(720)
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            card = rng.integers(30,225,(32,32),dtype=np.uint8)
+            refs = {'5':card, **{key:rng.integers(30,225,card.shape,dtype=np.uint8)
+                                  for key in ('empty','1','2','3','4')}}
+            for label,ref in refs.items(): write_image(root/(label+'.png'),ref)
+            anchor = [32,0,32,32]
+            profile_path = root/'profile.json'
+            frame = np.hstack([card.copy(),card])
+            frame[0,0] = 255-frame[0,0]
+            threshold = float(cv2.matchTemplate(frame[:,:32],card,cv2.TM_CCOEFF_NORMED)[0,0])+1e-7
+            group = {'templates':{k:[k+'.png'] for k in refs},
+                     'thresholds':{k:threshold for k in refs},'margin':.1}
+            profile_path.write_text(json.dumps({'frame_size':[64,32], 'groups':{'cards':group},
+                'regions':{'slots':[[0,0,32,32]]*5},'anchors':{'hand':{
+                    'template':'5.png','region':anchor,'threshold':.9}}}),encoding='utf-8')
+            reference = VisionProfile(profile_path,backend='cpu').read(frame)[0]
+            self.assertEqual(reference.slots,(None,)*5)
+            events = []
+            accelerated = VisionProfile(profile_path,backend='cuda',on_backend=lambda *e:events.append(e))
+            accelerated.read(np.zeros_like(frame))
+            products = np.stack([frame[:,:32]]*5).reshape(5,-1).astype('int64') @ np.stack(list(refs.values())).reshape(6,-1).T
+            # Overstate the winner by a few score ULPs to exercise the decision boundary.
+            products[:,0] += 30
+            with patch('cuda_match.CudaDot') as driver:
+                driver.return_value.products.side_effect = [products,OSError('GPU lost')]
+                self.assertEqual(accelerated.read(frame)[0],reference)
+                self.assertEqual(accelerated.read(frame)[0],reference)
+                self.assertEqual(accelerated.read(frame)[0],reference)
+                self.assertEqual([e[0] for e in events],['cpu','cuda','cpu'])
+                self.assertIn('GPU lost',events[-1][1])
+                self.assertEqual(driver.return_value.products.call_count,2)
+            events.clear()
+            accelerated = VisionProfile(profile_path,backend='auto',on_backend=lambda *e:events.append(e))
+            accelerated.read(np.zeros_like(frame))
+            with patch('cuda_match.CudaDot',side_effect=OSError('driver missing')) as driver:
+                self.assertEqual(accelerated.read(frame)[0],reference)
+                self.assertEqual(accelerated.read(frame)[0],reference)
+                driver.assert_called_once()
+                self.assertEqual([e[0] for e in events],['cpu','cpu'])
+                self.assertIn('driver missing',events[-1][1])
 
 def image_of(text):
     img = np.full((64,120),235,dtype=np.uint8)

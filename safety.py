@@ -38,6 +38,9 @@ def draw_completed(before, after):
 def initial(obs):
     return valid_observation(obs) and obs.slots == (0,0,0,0,0) and obs.inventory == INITIAL
 
+def success_candidate(obs):
+    return obs.page == 'hand' and obs.game_round in (1,None) and len(obs.slots) == 5 and obs.slots.count(5) >= 4
+
 class ObservationStabilizer:
     """Maintains only three independent captures, with an immediate success freeze."""
     def __init__(self):
@@ -62,7 +65,7 @@ class ObservationStabilizer:
 
     def add(self, frame, now):
         obs = frame.observation
-        if self.candidate_since is None and len(obs.slots) == 5 and obs.slots.count(5) >= 4:
+        if self.candidate_since is None and success_candidate(obs):
             self.candidate_since = frame.timestamp
         if self.frames and (frame.sequence <= self.frames[-1].sequence or frame.timestamp <= self.frames[-1].timestamp):
             self.frames.clear()
@@ -89,7 +92,8 @@ class ActionTracker:
         self.error = None
 
     def resume(self):
-        if self.terminated or self.pending is not None or self.candidate:
+        # Resuming a candidate restarts only verification; send() still forbids input.
+        if self.terminated or (self.pending is not None and not self.candidate):
             return False
         self.paused = False
         return True
@@ -103,7 +107,7 @@ class ActionTracker:
 
     def observe(self, obs):
         # A possible fourth five freezes actions even before inventory settles.
-        if len(obs.slots) == 5 and obs.slots.count(5) >= 4:
+        if success_candidate(obs):
             self.candidate = True
             if valid_observation(obs):
                 self.stop()

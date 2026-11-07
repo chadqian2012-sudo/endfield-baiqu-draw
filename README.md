@@ -8,6 +8,20 @@
 
 程序会记住选择的文件。若游戏重启后提示窗口已变化，可点「重新绑定游戏」再开始。游戏程序、窗口大小和显示缩放须与原设置一致。请保留 EXE 旁的配置、裁剪图和 `logs` 文件夹。当前这套实机素材仍待补齐，实机进展见 [PROGRESS.md](PROGRESS.md)。
 
+## 默认会自动选用可工作的方式
+
+双击后通常保留「运行方式 → 自动」即可。运行时，窗口底部显示当前使用的识别、截图及点击方式。遇到兼容性问题，可以先结束本次运行，再在菜单里分别选择。菜单会记住选择。
+
+- **识别**。用 NVIDIA 驱动的 CUDA 批量比对手牌和库存模板。使用发布版 EXE 无需另装 CUDA 工具包。小区域和接近识别阈值的结果由 OpenCV 核对。显卡不可用或运算出错时，同一帧转交 CPU。OpenCV 在硬件支持时使用 SIMD 向量指令。选择 CPU 可直接使用这条路径。
+- **截图**。优先用 MSS 读取可见客户区。该接口明确失败时，自动方式会尝试 Windows 的 DXGI 桌面复制。DXGI 要求整个游戏窗口位于同一块未旋转的屏幕；使用旋转屏时可选 MSS。DXGI 采集进程随本次运行结束，显示器映射变化会丢弃该帧。没有新画面时继续等候，纯黑画面不计为新观察。两种方式都会在取图前后核对游戏窗口和前台状态。
+- **点击**。优先使用系统鼠标输入（SendInput）。只有 Windows 明确报告接口不支持，并确认写入零个事件时，自动方式才会尝试向命中游戏窗口发送鼠标消息。权限拒绝、已经按下鼠标、结果不明或游戏没有响应，都会阻止自动补点。两种方式在提交前都核对落点，F8、F9 和一次只发送一个待确认动作的规则照常生效。
+
+在本机 RTX 3070 Ti Laptop 上，同一批 22 个旧录像画面各测三遍。热机识别中位耗时从 CPU 的 21.78 毫秒降至 CUDA 的 10.33 毫秒，22 个画面的牌面、库存读数及拒识结果逐项一致。这个数字只计识别时间，实机抽牌还包含点击、动画和连续观察。
+
+命令行也支持分别选择。例如使用 `run --vision-backend cpu --capture-backend dxgi --input-backend window-message`，其余参数仍按下文填写。回放只使用识别方式。运行日志中的 `backend` 事件记录方式及原因，`input_sent` 记录输入已提交，随后还要从游戏画面确认结果。
+
+系统接口说明可查阅 [Windows 桌面复制](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/desktop-dup-api)、[鼠标输入返回值](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) 和 [点击落点对应的窗口](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-windowfrompoint)。
+
 ## 从源码或命令行运行
 
 Windows 64 位、Python 3.12。解压源码后在项目目录运行：
