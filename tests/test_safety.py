@@ -1,18 +1,43 @@
 import unittest
 import time
+import ctypes
 from unittest.mock import Mock, patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from ake import drive, frames_from_recording
 from ake_core import Observation
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, draw_completed, stable
-from windowing import WindowIdentity, click
+from windowing import WindowIdentity, click, _api
 
 EMPTY = Observation((0,0,0,0,0),(6,6,6,6,10),1)
 FIVE = Observation((5,0,0,0,0),(6,6,6,6,9),1)
 STALE_STOCK = Observation((5,0,0,0,0),(6,6,6,6,10),1)
 
 class SafetyTests(unittest.TestCase):
+    def test_api_requires_thread_dpi_context_with_pointer_sized_signatures(self):
+        for previous in (None,0,ctypes.c_void_p(-2).value):
+            with self.subTest(previous_context=previous):
+                user,kernel = Mock(),Mock()
+                user.SetThreadDpiAwarenessContext.return_value = previous
+                with patch('windowing.ctypes.WinDLL',side_effect=[user,kernel]) as libraries, \
+                     patch('windowing.ctypes.get_last_error',return_value=5):
+                    if previous:
+                        self.assertEqual(_api(),(user,kernel))
+                    else:
+                        with self.assertRaisesRegex(OSError,'cannot set Per-Monitor V2 DPI awareness'):
+                            _api()
+                        user.GetForegroundWindow.assert_not_called()
+                    self.assertEqual([call.args[0] for call in libraries.call_args_list],['user32','kernel32'])
+                setter = user.SetThreadDpiAwarenessContext
+                self.assertEqual(setter.argtypes,[ctypes.c_void_p])
+                self.assertIs(setter.restype,ctypes.c_void_p)
+                setter.assert_called_once()
+                context, = setter.call_args.args
+                self.assertIsInstance(context,ctypes.c_void_p)
+                self.assertEqual(context.value,ctypes.c_void_p(-4).value)
+                user.SetProcessDpiAwarenessContext.assert_not_called()
+                user.SendInput.assert_not_called()
+
     def test_recording_matches_csv_frames_and_releases_video(self):
         with TemporaryDirectory() as folder:
             recording = Path(folder)

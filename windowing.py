@@ -17,11 +17,10 @@ def _api():
     if os.name != 'nt': raise RuntimeError('Windows required')
     u = ctypes.WinDLL('user32', use_last_error=True)
     k = ctypes.WinDLL('kernel32', use_last_error=True)
-    try:
-        u.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
-        u.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-    except AttributeError:
-        pass
+    u.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+    u.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    if not u.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4)):
+        raise ctypes.WinError(ctypes.get_last_error(),'cannot set Per-Monitor V2 DPI awareness for current thread')
     u.GetForegroundWindow.restype = wintypes.HWND
     u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     u.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
