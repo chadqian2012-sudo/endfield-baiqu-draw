@@ -379,13 +379,13 @@ def main(argv=None):
         return 0
     from vision import VisionProfile
     if args.command == 'calibrate':
-        from windowing import find_unique, foreground_matches
+        from windowing import find_unique
         binding = find_unique()
         if args.layout is None:
             import cv2
-            if not foreground_matches(binding):
-                raise ValueError('place game in foreground before interactive calibration')
-            frame = next(frames_from_window(binding,1))[2]
+            dump({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
+            frame = next((image for _,_,image,focused in frames_from_window(binding,10) if focused),None)
+            if frame is None: raise ValueError('foreground game capture timed out')
             config = {'frame_size':list(binding.client[2:]),'regions':{},'groups':{},'anchors':{},'training_batches':[]}
             try:
                 for name,count in [('slots',5),('inventory',5),('round',1),('draw',1),('abandon',1),('confirm',1),('hand',1),('abandon_dialog',1)]:
@@ -430,11 +430,13 @@ def main(argv=None):
                     image,distance = frame,abs(stamp-args.at)
             if image is None: raise ValueError('recording has no frames')
         else:
-            from windowing import find_unique, foreground_matches
+            from windowing import find_unique
             binding = find_unique()
-            if json.loads(json.dumps(asdict(binding))) != profile.config.get('window') or not foreground_matches(binding):
-                raise ValueError('sample requires calibrated foreground window')
-            image = next(frames_from_window(binding,1))[2]
+            if json.loads(json.dumps(asdict(binding))) != profile.config.get('window'):
+                raise ValueError('sample requires calibrated window')
+            dump({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
+            image = next((image for _,_,image,focused in frames_from_window(binding,10) if focused),None)
+            if image is None: raise ValueError('foreground game capture timed out')
         profile.add_sample(image,args.group,args.label,args.index,args.digit,args.score,args.margin,args.batch)
         dump({'sample_saved':True,'issues':VisionProfile(args.profile).issues()})
         return 0
@@ -463,6 +465,7 @@ def main(argv=None):
         Path('logs').mkdir(exist_ok=True)
         handler = StrictLog('logs/events.jsonl',maxBytes=2_000_000,backupCount=3,encoding='utf-8')
         def emit(event):
+            event = {'time':datetime.now().astimezone().isoformat(),'monotonic':time.monotonic(),**event}
             handler.emit(logging.LogRecord('ake',logging.INFO,'',0,json.dumps(event,ensure_ascii=False),(),None))
             dump(event)
         if args.command == 'replay':

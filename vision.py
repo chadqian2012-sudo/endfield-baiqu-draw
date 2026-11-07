@@ -30,7 +30,7 @@ def classify(image, templates, thresholds, minimum_margin):
     """
     if image is None or image.ndim != 2 or image.size == 0 or not templates:
         return Match(None, None, None)
-    if minimum_margin is None or not 0 <= minimum_margin <= 2:
+    if minimum_margin is None or not 0 < minimum_margin <= 2:
         return Match(None, None, None)
     scores = {}
     for label, samples in templates.items():
@@ -206,6 +206,8 @@ class VisionProfile:
             if parts is None or not 0 <= digit < len(parts):
                 raise ValueError('cannot segment requested inventory digit')
             image = normalize_digit(parts[digit])
+        if np.std(image) < 1:
+            raise ValueError('sample lacks visual detail')
         assets = self.path.parent/'logs'/'calibration-assets'
         assets.mkdir(parents=True,exist_ok=True)
         file = assets/(uuid4().hex+'.png')

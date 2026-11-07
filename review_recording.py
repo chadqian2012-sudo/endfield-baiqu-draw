@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 import cv2
 import numpy as np
+from vision import write_image
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -36,8 +37,7 @@ def main():
         tiles.append(np.zeros_like(tiles[0]))
     sheet = np.vstack([np.hstack(tiles[i:i+columns]) for i in range(0,len(tiles),columns)])
     output = args.recording/'contact-sheet.png'
-    if not cv2.imwrite(str(output), sheet):
-        raise SystemExit('Could not write contact sheet')
+    write_image(output,sheet)
     print(output)
 
 if __name__ == '__main__': main()
