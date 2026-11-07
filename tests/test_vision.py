@@ -252,6 +252,49 @@ class VisionTests(unittest.TestCase):
                 hotkeys.return_value.close.assert_called_once_with()
                 log.return_value.close.assert_called_once_with()
 
+    def test_persistent_log_failure_still_prints_one_summary_and_stops_input(self):
+        binding = WindowIdentity(1,2,3,'fixture.exe',(0,0,8,8),96)
+        for target in ('armed','strategy','input_intent','success','evidence_error','summary'):
+            with self.subTest(first_failed_event=target):
+                terminal = target in ('success','evidence_error','summary')
+                obs = (Observation((5,5,5,5,0),(6,6,6,6,6),1) if terminal else
+                       Observation((0,)*5,(6,6,6,6,10),1,buttons=('enabled','enabled',None)))
+                profile = Mock(config={'window':json.loads(json.dumps(asdict(binding)))},regions={'draw':[0,0,1,1]})
+                profile.issues.return_value = []
+                profile.read.return_value = obs,{}
+                now,events,failed = [0.0],[],False
+                def frames():
+                    for i in range(3):
+                        now[0] = i*.125
+                        yield i,now[0],object(),True
+                def write_log(record):
+                    nonlocal failed
+                    failed |= json.loads(record.msg)['event'] == target
+                    if failed: raise RuntimeError('critical log write failed')
+                with patch('vision.VisionProfile',return_value=profile), \
+                     patch('pathlib.Path.read_text',return_value='{"dataset":"fixture.jsonl"}'), \
+                     patch('pathlib.Path.mkdir'), patch('ake.validate',return_value={'errors':[]}), \
+                     patch('ake.StrictLog') as log, patch('ake.frames_from_window',return_value=frames()), \
+                     patch('windowing.find_unique',return_value=binding), \
+                     patch('windowing.Hotkeys') as hotkeys, patch('windowing.click') as click, \
+                     patch('ake.evidence',return_value='fixture-evidence',
+                           side_effect=OSError('disk full') if target=='evidence_error' else None), \
+                     patch('ake.time.monotonic',side_effect=lambda:now[0]), \
+                     patch('ake.dump',side_effect=events.append):
+                    presses = iter([[0x77]])
+                    hotkeys.return_value.poll.side_effect = lambda:next(presses,[])
+                    log.return_value.emit.side_effect = write_log
+                    self.assertEqual(main(['run','--live','--profile','unused','--qualification','unused']),1)
+                self.assertTrue(failed)
+                summaries = [event for event in events if event.get('event')=='summary']
+                self.assertEqual(len(summaries),1)
+                self.assertEqual(summaries[0]['termination_reason'],'success' if terminal else 'error: critical log write failed')
+                if terminal: self.assertIn('evidence_seconds',summaries[0])
+                if target=='input_intent': self.assertEqual(summaries[0]['pending_action'],{'id':1,'action':'draw'})
+                click.assert_not_called()
+                hotkeys.return_value.close.assert_called_once_with()
+                log.return_value.close.assert_called_once_with()
+
     def test_cli_preparation_failures_use_structured_exit_and_preserve_argparse(self):
         sample = ['sample','--profile','unused','--image','unused','--group','cards',
                   '--label','5','--score','.95','--margin','.1','--batch','fixture']
