@@ -81,7 +81,15 @@ F8 启动或恢复后，持续未知、无法取得三帧稳定观察或下一�
 
 缺模板、库存不一致、窗口身份变化和验证失败均应先检查素材和校准，不应提高点击频率。首次接管非空手牌只读提示，用户手动返回空牌面后再启动。当前缺少完整库存字符、第二轮及独立实机验收素材，尚不能宣称当前电脑可可靠自动运行。
 
-开发验证：`python -m unittest discover -s tests -v`。打包：在隔离环境安装 `pyinstaller==6.11.1` 后运行 `python -m PyInstaller --clean --noconfirm --onefile --name AKE ake.py`。打包产物仍需做实机验收。
+开发验证：`python -m unittest discover -s tests -v`。在上述隔离环境中打包，构建缓存及中间文件保存在当前项目的 `captures` 内：
+
+```powershell
+python -m pip install pyinstaller==6.11.1 pyinstaller-hooks-contrib==2026.9
+$env:PYINSTALLER_CONFIG_DIR = Join-Path $PWD 'captures\pyinstaller-cache'
+python -m PyInstaller --clean --noconfirm --onefile --name AKE --specpath captures --workpath captures\pyinstaller-build --distpath dist ake.py
+```
+
+2026-11-02 已从提交 `26647cd` 构建本地 Windows x64 EXE 候选，58 项源码离线检查和 13 项 EXE 黑盒检查通过，涵盖命令行、错误退出、中文路径采样保存和合成录像回放。该候选已包含线程 DPI、动作确认、计时及配置保存修复；构建结果见 [PROGRESS.md](PROGRESS.md)。它尚未作为 GitHub Release 发布，也未通过真实游戏识别、点击或成功终止验收。
 
 以下保留原始开发需求，作为实现和验收依据。
 
