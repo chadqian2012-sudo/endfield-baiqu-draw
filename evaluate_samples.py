@@ -8,8 +8,7 @@ import csv
 import json
 from collections import defaultdict
 from pathlib import Path
-import cv2
-from vision import classify
+from vision import classify, read_image
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -25,13 +24,13 @@ def main():
         train = defaultdict(list)
         for row in rows:
             if row['recording'] != heldout:
-                im = cv2.imread(str(args.samples / row['file']), cv2.IMREAD_GRAYSCALE)
+                im = read_image(args.samples / row['file'])
                 if im is None: raise ValueError('missing sample: '+row['file'])
                 train[row['label']].append(im)
         counts = defaultdict(lambda: {'total':0,'correct':0,'rejected':0,'wrong':0})
         for row in rows:
             if row['recording'] != heldout: continue
-            im = cv2.imread(str(args.samples / row['file']), cv2.IMREAD_GRAYSCALE)
+            im = read_image(args.samples / row['file'])
             if im is None: raise ValueError('missing sample: '+row['file'])
             match = classify(im, train, {label:args.min_score for label in train}, args.min_margin)
             count = counts[row['label']]

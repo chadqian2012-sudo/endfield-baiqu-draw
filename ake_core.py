@@ -43,26 +43,22 @@ class Observation:
     game_round: int
     stable: bool = True
     fresh: bool = True
+    page: str = 'hand'
+    buttons: tuple = (None, None, None)
+
+def valid_observation(obs: Observation) -> bool:
+    return (obs.stable and obs.fresh and obs.page == 'hand' and obs.game_round == 1
+            and len(obs.slots) == 5 and len(obs.inventory) == 5
+            and all(type(v) is int and 0 <= v <= 5 for v in obs.slots)
+            and all(type(v) is int and v >= 0 for v in obs.inventory)
+            and all(obs.inventory[v-1]+obs.slots.count(v) == INITIAL[v-1] for v in range(1,6)))
 
 def decide(obs: Observation, early_restart: bool = False) -> Decision:
-    if len(obs.slots) != 5 or not obs.stable or not obs.fresh:
-        return Decision.WAIT
-    if any(type(x) is not int or x not in range(6) for x in obs.slots):
-        return Decision.WAIT
-    if len(obs.inventory) != 5 or any(type(x) is not int or x < 0 for x in obs.inventory):
-        return Decision.WAIT
-    # Candidate target freezes input even while inventory is changing.
-    if obs.slots.count(5) >= 4:
-        if obs.game_round != 1 or any(x not in (0,1,2,3,4,5) for x in obs.slots):
-            return Decision.WAIT
-        if len(obs.inventory) == 5 and all(obs.inventory[v-1] + obs.slots.count(v) == INITIAL[v-1] for v in range(1,6)):
-            return Decision.SUCCESS
-        return Decision.WAIT
-    if obs.game_round != 1 or any(x not in (0,1,2,3,4,5) for x in obs.slots):
-        return Decision.WAIT
-    if len(obs.inventory) != 5 or any(obs.inventory[v-1] + obs.slots.count(v) != INITIAL[v-1] for v in range(1,6)):
+    if not valid_observation(obs):
         return Decision.WAIT
     k = obs.slots.count(5)
+    if k >= 4:
+        return Decision.SUCCESS
     n = sum(x != 0 for x in obs.slots)
     j = n - k
     if k + 5 - n < 4 or (early_restart and n == 1 and j == 1):
