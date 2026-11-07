@@ -24,6 +24,14 @@ class Match:
     score: float | None
     margin: float | None
 
+def best_match(scores, thresholds, minimum_margin):
+    if len(scores) < 2:
+        return Match(None, None, None)
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    label, score = ranked[0]
+    margin = score - ranked[1][1]
+    return Match(label if score >= thresholds[label] and margin >= minimum_margin else None, score, margin)
+
 def classify(image, templates, thresholds, minimum_margin):
     """Return unknown when no calibrated match clears both acceptance checks.
 
@@ -47,12 +55,7 @@ def classify(image, templates, thresholds, minimum_margin):
                 return Match(None, None, None)
             results.append(score)
         scores[label] = max(results)
-    if len(scores) < 2:
-        return Match(None, None, None)
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    label, score = ranked[0]
-    margin = score - ranked[1][1]
-    return Match(label if score >= thresholds[label] and margin >= minimum_margin else None, score, margin)
+    return best_match(scores,thresholds,minimum_margin)
 
 def recognize_card(image, templates, thresholds, minimum_margin):
     """Require calibrated examples for every supported card class and empty slot."""
@@ -99,19 +102,22 @@ def recognize_stock(image, templates, thresholds, minimum_margin):
     expected = set('0123456789')
     if set(templates) != expected or set(thresholds) != expected:
         return None
-    parts = segment_digits(image)
-    if parts is None:
-        return None
+    return inventory_values([image],lambda digits: [
+        classify(d,templates,thresholds,minimum_margin) for d in digits])[0]
+
+def inventory_values(images, match_digits):
+    digits, lengths = [], []
+    for image in images:
+        parts = segment_digits(image) or []
+        digits.extend(normalize_digit(part) for part in parts)
+        lengths.append(len(parts))
+    readings = iter(match_digits(digits))
     values = []
-    for part in parts:
-        matched = classify(normalize_digit(part),templates,thresholds,minimum_margin)
-        if matched.label is None:
-            return None
-        values.append(matched.label)
-    value = ''.join(values)
-    if len(value) == 2 and value != '10':
-        return None
-    return int(value)
+    for length in lengths:
+        labels = [next(readings).label for _ in range(length)]
+        text = ''.join(labels) if all(labels) else ''
+        values.append(int(text) if len(text) == 1 or text == '10' else None)
+    return values
 
 
 class VisionProfile:
@@ -120,7 +126,16 @@ class VisionProfile:
                'round': {'1','2'}, 'draw': {'enabled','disabled'},
                'abandon': {'enabled','disabled'}, 'confirm': {'enabled','disabled'}}
 
-    def __init__(self, path):
+    def __init__(self, path, *, backend='auto', on_backend=None):
+        if backend not in ('auto','cuda','cpu'):
+            raise ValueError('unknown recognition backend: '+str(backend))
+        self.backend = backend
+        self.on_backend = on_backend
+        self.actual_backend = None
+        self.backend_reason = None
+        self.cuda = None
+        self.cuda_error = None
+        self.batches = {}
         self.path = Path(path).resolve()
         self.config = json.loads(self.path.read_text(encoding='utf-8-sig'))
         self.size = tuple(self.config['frame_size'])
@@ -210,10 +225,76 @@ class VisionProfile:
             if name not in self.anchors: issues.append('missing anchor: '+name)
         return issues
 
-    def match_group(self, gray, name, roi):
+    def report_backend(self, actual, reason):
+        if (actual,reason) == (self.actual_backend,self.backend_reason): return
+        self.actual_backend = actual
+        self.backend_reason = reason
+        if self.on_backend: self.on_backend(actual,reason)
+
+    def match_images(self, name, images):
+        unknown = Match(None,None,None)
+        output = [unknown]*len(images)
         bank, thresholds, margin = self.groups.get(name, ({},{},None))
-        if set(bank) != self.CLASSES[name]: return Match(None,None,None)
-        return classify(self.crop(gray,roi),bank,thresholds,margin)
+        if (not images or set(bank) != self.CLASSES[name] or set(thresholds) != self.CLASSES[name]
+                or not all(bank.values()) or not all(0 <= v <= 1 for v in thresholds.values())
+                or margin is None or not 0 < margin <= 2):
+            return output
+        if name not in self.batches:
+            samples = [sample for refs in bank.values() for sample in refs]
+            mean, sd = np.asarray([cv2.meanStdDev(s) for s in samples]).reshape(-1,2).T
+            offsets = np.cumsum([0]+[len(refs) for refs in bank.values()])[:-1]
+            valid = all(s.shape == samples[0].shape for s in samples) and np.all(sd >= 1)
+            self.batches[name] = (samples,mean,sd,offsets) if valid else None
+        batch = self.batches[name]
+        if batch is None: return output
+        samples, ref_mean, ref_sd, offsets = batch
+        indices, crops, stats = [], [], []
+        for i,img in enumerate(images):
+            if img.shape != samples[0].shape: continue
+            mean, sd = cv2.meanStdDev(img)
+            if sd.item() < 1: continue
+            indices.append(i)
+            crops.append(img)
+            stats.append((mean.item(),sd.item()))
+        if not crops: return output
+
+        gpu_scores = None
+        if (self.backend != 'cpu' and not self.cuda_error and name in ('cards','stock')
+                and all(img.dtype == np.uint8 for img in crops)):
+            from cuda_match import CudaDot
+            try:
+                if self.cuda is None: self.cuda = CudaDot()
+                products = self.cuda.products(name,crops,samples)
+            except (OSError,AttributeError) as error:
+                self.cuda_error = str(error)
+                if self.cuda is not None: self.cuda.close()
+                self.cuda = None
+                self.report_backend('cpu',self.cuda_error)
+            else:
+                means, sds = np.asarray(stats).T
+                gpu_scores = (products / crops[0].size - means[:,None]*ref_mean) / (sds[:,None]*ref_sd)
+                gpu_scores = np.clip(gpu_scores,-1,1)
+                self.report_backend('cuda','CUDA dot products; OpenCV for small regions')
+
+        for row,(index,crop) in enumerate(zip(indices,crops)):
+            if gpu_scores is not None:
+                scores = dict(zip(bank,np.maximum.reduceat(gpu_scores[row],offsets).tolist()))
+                match = best_match(scores,thresholds,margin)
+                winner = max(scores,key=scores.get)
+                # OpenCV's float correlation cancels more strongly on low-contrast crops.
+                # Near a decision boundary, re-score the entire crop with calibrated OpenCV.
+                tolerance = 64*np.finfo(np.float32).eps*255**2 / (stats[row][1]*ref_sd.min())
+                if (abs(match.score-thresholds[winner]) > tolerance and match.margin > 2*tolerance
+                        and abs(match.margin-margin) > 2*tolerance):
+                    output[index] = match
+                    continue
+            scores = [cv2.matchTemplate(crop,s,cv2.TM_CCOEFF_NORMED)[0,0] for s in samples]
+            if np.all(np.isfinite(scores)):
+                output[index] = best_match(dict(zip(bank,np.maximum.reduceat(scores,offsets).tolist())),thresholds,margin)
+        return output
+
+    def match_group(self, gray, name, roi):
+        return self.match_images(name,[self.crop(gray,roi)])[0]
 
     def add_sample(self, frame, group, label, index, digit, score, margin, batch):
         if frame.shape[:2] != (self.size[1],self.size[0]):
@@ -240,12 +321,13 @@ class VisionProfile:
         assets.mkdir(parents=True,exist_ok=True)
         file = assets/(uuid4().hex+'.png')
         write_image(file,image)
+        reference = str(file.relative_to(self.path.parent))
         config = deepcopy(self.config)
         if group in ('hand','abandon_dialog'):
-            config.setdefault('anchors',{})[group] = {'region':roi,'template':str(file),'threshold':score}
+            config.setdefault('anchors',{})[group] = {'region':roi,'template':reference,'threshold':score}
         else:
             data = config.setdefault('groups',{}).setdefault(group,{'templates':{},'thresholds':{}})
-            data['templates'].setdefault(label,[]).append(str(file))
+            data['templates'].setdefault(label,[]).append(reference)
             data['thresholds'][label] = score
             data['margin'] = margin
         batches = config.setdefault('training_batches',[])
@@ -271,13 +353,13 @@ class VisionProfile:
         game_round = None
         buttons = {name:None for name in ('draw','abandon','confirm')}
         if page == 'hand':
-            for i,roi in enumerate(self.regions.get('slots', [])):
-                match = self.match_group(gray,'cards',roi)
+            card_crops = [self.crop(gray,roi) for roi in self.regions.get('slots', [])]
+            for i,match in enumerate(self.match_images('cards',card_crops)):
                 quality['slot_'+str(i+1)] = asdict(match)
                 slots[i] = 0 if match.label == 'empty' else int(match.label) if match.label else None
-            bank, thresholds, margin = self.groups.get('stock', ({},{},None))
-            for i,roi in enumerate(self.regions.get('inventory', [])):
-                inventory[i] = recognize_stock(self.crop(gray,roi),bank,thresholds,margin)
+            if 'inventory' in self.regions:
+                stock = [self.crop(gray,roi) for roi in self.regions['inventory']]
+                inventory = inventory_values(stock,lambda digits:self.match_images('stock',digits))
             if 'round' in self.regions:
                 label = self.match_group(gray,'round',self.regions['round']).label
                 game_round = int(label) if label else None
@@ -285,5 +367,7 @@ class VisionProfile:
                 if name in self.regions: buttons[name] = self.match_group(gray,name,self.regions[name]).label
         elif page == 'abandon_dialog' and 'confirm' in self.regions:
             buttons['confirm'] = self.match_group(gray,'confirm',self.regions['confirm']).label
+        if self.actual_backend is None:
+            self.report_backend('cpu','OpenCV CPU (SIMD when supported)')
         return Observation(tuple(slots),tuple(inventory),game_round,page=page,
                            buttons=tuple(buttons[name] for name in ('draw','abandon','confirm'))),quality
