@@ -162,7 +162,8 @@ def _dxgi_process(binding,region=None):
         process.start()
         child.close()
         deadline = monotonic()+12
-        ready = pending_discard = False
+        ready = False
+        pending_discard = True  # Discard desktop updates queued during helper startup.
         def grab(discard=False):
             nonlocal ready,pending_discard
             pending_discard |= discard
@@ -222,6 +223,7 @@ class WindowCapture(ExitStack):
         self.reader = None
         self.reason = ''
         self.discard = False
+        self.reported = None
 
     def _focused(self):
         focused = foreground_matches(self.binding, require_identity=True)
@@ -237,8 +239,6 @@ class WindowCapture(ExitStack):
                     if not self._unavailable(error):
                         return None, False
                     continue
-                if self.on_backend:
-                    self.on_backend(self.active, self.reason)
                 # Opening a duplication session can take longer than a frame.
                 if not self._focused():
                     return None, False
@@ -262,7 +262,12 @@ class WindowCapture(ExitStack):
                 raise ValueError('截图与已校准的游戏尺寸不符。')
             # An unchanged hand can be legitimate. A fresh all-black surface
             # carries no evidence and alone does not prove the backend failed.
-            return (image if image.any() else None), True
+            if not image.any():
+                return None, True
+            if self.reported != self.active:
+                self.reported = self.active
+                if self.on_backend: self.on_backend(self.active,self.reason)
+            return image, True
         return None, False
 
     def _unavailable(self, error):

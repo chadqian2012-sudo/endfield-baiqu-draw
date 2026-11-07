@@ -53,7 +53,7 @@ class CaptureTests(TestCase):
                     self.assertTrue(focused)
                     np.testing.assert_array_equal(frame,pixels)
             self.assertEqual(closed,['mss','dxgi'])
-            self.assertEqual([name for name,_ in selected],['mss','dxgi'])
+            self.assertEqual([name for name,_ in selected],['dxgi'])
             self.assertIn('BitBlt',selected[-1][1])
             with WindowCapture(binding,'mss') as capture, self.assertRaisesRegex(RuntimeError,'BitBlt'):
                 capture.grab()
