@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
 import time
+from math import isfinite
 from ake_core import Observation, Decision, chance, decide, valid_observation
 from math_verify import threshold, totals
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, initial, draw_completed
@@ -54,10 +55,16 @@ def frames_from_recording(recording):
     if not video.isOpened(): raise ValueError('cannot open recording')
     try:
         with (recording/'frames.csv').open(encoding='utf-8',newline='') as f:
-            for row in csv.DictReader(f):
+            previous_time = None
+            for index,row in enumerate(csv.DictReader(f)):
+                sequence,stamp = int(row['frame']),float(row['elapsed_seconds'])
+                if sequence != index or not isfinite(stamp) or stamp < 0 or (previous_time is not None and stamp <= previous_time):
+                    raise ValueError('invalid recording frame index or timestamp')
                 ok,image = video.read()
                 if not ok: raise ValueError('video and timestamp log differ')
-                yield int(row['frame']),float(row['elapsed_seconds']),image,True
+                previous_time = stamp
+                yield sequence,stamp,image,True
+            if video.read()[0]: raise ValueError('video and timestamp log differ')
     finally:
         video.release()
 
@@ -86,6 +93,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     stabilizer = ObservationStabilizer()
     timings = Timings()
     last_hand = None
+    last_observation = None
     last_output = None
     entered = False
     cycle_started = reset_started = None
@@ -136,121 +144,134 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             last_policy = timings.early_restart
 
     if mode == 'live': emit({'event':'armed','message':'F8 start/pause, F9 terminal stop'})
-    for sequence,stamp,image,focused in frames:
-        now[0] = stamp
-        handle_keys()
-        if tracker.terminated: break
-        if not focused:
-            stabilizer.frames.clear()
-            if mode == 'live': stabilizer.pause(stamp)
-            if mode == 'live' and not tracker.paused:
-                pause('focus lost; F8 required after reconciliation')
-            continue
-        obs,quality = profile.read(image)
-        stable_obs = stabilizer.add(Frame(sequence,stamp,obs),stamp if mode == 'replay' else time.monotonic())
-        tracker.candidate = stabilizer.candidate_since is not None
-        decision = decide(stable_obs,timings.early_restart) if stable_obs is not None else Decision.WAIT
-        if decision == Decision.SUCCESS:
-            if tracker.pending and tracker.pending[1] == Action.DRAW and draw_completed(tracker.pending[2],obs):
-                tracker.reconcile(obs)
-                counters['cards_confirmed'] += 1
-                timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
-            tracker.stop()
-            reason = 'success'
-            path = save(image,'success') if save else None
-            emit({'event':'success','observation':asdict(obs),'evidence':path})
-            break
-        if mode == 'live' and stabilizer.candidate_timed_out(stamp,tracker.timeout):
-            reason = 'suspected success; confirmation timeout'
-            pause(reason)
-            if save: save(image,reason)
-            break
-        if stable_obs is None:
-            if mode == 'live' and not tracker.candidate and tracker.check_timeout():
-                pause(tracker.error)
-                if save: save(image,tracker.error)
-            continue
-        if tracker.candidate:
-            if last_output != 'candidate':
-                emit({'event':'suspected_success','reason':'input frozen; awaiting consistent inventory'})
-                last_output = 'candidate'
-            continue
-        if not entered:
-            if initial(obs):
-                entered = True
-                last_hand = obs
-                active_started = stamp
-                if mode == 'live' and tracker.paused: paused_started = stamp
-                new_attempt()
-        if mode != 'live':
-            semantic = (obs,decision,entered)
-            if semantic != last_output:
-                emit({'event':'observation' if mode == 'observe' else 'recommendation',
-                      'observation':asdict(obs),'decision':decision.value if entered else 'wait','quality':quality})
-                last_output = semantic
-            continue
-        if not entered and valid_observation(obs):
-            if last_output != 'takeover':
-                emit({'event':'takeover_refused','reason':'nonempty initial hand; return manually to empty round 1'})
-                last_output = 'takeover'
-            tracker.pause()
-            continue
-        if tracker.pending:
-            _,action,_ = tracker.pending
-            dialog = obs.page == 'abandon_dialog' and obs.buttons[2] == 'enabled'
-            if tracker.reconcile(obs,expected_abandon_dialog=dialog):
-                emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
-                if action == Action.DRAW:
+    try:
+        for sequence,stamp,image,focused in frames:
+            now[0] = stamp
+            handle_keys()
+            if tracker.terminated: break
+            if not focused:
+                stabilizer.frames.clear()
+                if mode == 'live': stabilizer.pause(stamp)
+                if mode == 'live' and not tracker.paused:
+                    pause('focus lost; F8 required after reconciliation')
+                continue
+            obs,quality = profile.read(image)
+            last_observation = obs
+            stable_obs = stabilizer.add(Frame(sequence,stamp,obs),stamp if mode == 'replay' else time.monotonic())
+            tracker.candidate = stabilizer.candidate_since is not None
+            decision = decide(stable_obs,timings.early_restart) if stable_obs is not None else Decision.WAIT
+            if decision == Decision.SUCCESS:
+                if tracker.pending and tracker.pending[1] == Action.DRAW and draw_completed(tracker.pending[2],obs):
+                    tracker.reconcile(obs)
                     counters['cards_confirmed'] += 1
                     timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
+                tracker.stop()
+                reason = 'success'
+                path = save(image,'success') if save else None
+                emit({'event':'success','observation':asdict(obs),'evidence':path})
+                break
+            if mode == 'live' and stabilizer.candidate_timed_out(stamp,tracker.timeout):
+                reason = 'suspected success; confirmation timeout'
+                pause(reason)
+                if save: save(image,reason)
+                break
+            if stable_obs is None:
+                if mode == 'live' and not tracker.candidate and tracker.check_timeout():
+                    pause(tracker.error)
+                    if save: save(image,tracker.error)
+                continue
+            if tracker.candidate:
+                if last_output != 'candidate':
+                    emit({'event':'suspected_success','reason':'input frozen; awaiting consistent inventory'})
+                    last_output = 'candidate'
+                continue
+            if not entered:
+                if initial(obs):
+                    entered = True
                     last_hand = obs
-                elif action == Action.CONFIRM:
-                    counters['restarts_completed'] += 1
-                    timings.add('restart',stamp-reset_started,uninterrupted=cycle_clean)
-                    last_hand = obs
+                    active_started = stamp
+                    if mode == 'live' and tracker.paused: paused_started = stamp
                     new_attempt()
-            elif tracker.check_timeout():
-                pause(tracker.error)
-                if save: save(image,tracker.error)
-            continue
-        if tracker.paused or not entered: continue
-        if tracker.phase == 'dialog':
-            if obs.page != 'abandon_dialog' or obs.buttons[2] != 'enabled':
-                pause('expected abandon dialog no longer aligned')
+            if mode != 'live':
+                semantic = (obs,decision,entered)
+                if semantic != last_output:
+                    emit({'event':'observation' if mode == 'observe' else 'recommendation',
+                          'observation':asdict(obs),'decision':decision.value if entered else 'wait','quality':quality})
+                    last_output = semantic
                 continue
-            action,context,button = Action.CONFIRM,last_hand,'confirm'
-        else:
-            if (not valid_observation(obs) or obs.slots != last_hand.slots or obs.inventory != last_hand.inventory):
-                pause('unexplained or unknown state; manual reconciliation required')
+            if not entered and valid_observation(obs):
+                if last_output != 'takeover':
+                    emit({'event':'takeover_refused','reason':'nonempty initial hand; return manually to empty round 1'})
+                    last_output = 'takeover'
+                tracker.pause()
                 continue
-            action = Action.DRAW if decision == Decision.DRAW else Action.ABANDON
-            context,button = obs,'draw' if action == Action.DRAW else 'abandon'
-            if obs.buttons[0 if action == Action.DRAW else 1] != 'enabled': continue
-        handle_keys()
-        if tracker.paused or tracker.terminated or time.monotonic()-stamp > .5: continue
-        cycle_started = stamp
-        if action == Action.ABANDON:
-            reset_started = stamp
-            cycle_clean = True
-        elif action == Action.DRAW:
-            cycle_clean = True
-        def permitted():
+            if tracker.pending:
+                _,action,_ = tracker.pending
+                dialog = obs.page == 'abandon_dialog' and obs.buttons[2] == 'enabled'
+                if tracker.reconcile(obs,expected_abandon_dialog=dialog):
+                    emit({'event':'action_confirmed','action':action.value,'observation':asdict(obs)})
+                    if action == Action.DRAW:
+                        counters['cards_confirmed'] += 1
+                        timings.add('draw',stamp-cycle_started,uninterrupted=cycle_clean)
+                        last_hand = obs
+                    elif action == Action.CONFIRM:
+                        counters['restarts_completed'] += 1
+                        timings.add('restart',stamp-reset_started,uninterrupted=cycle_clean)
+                        last_hand = obs
+                        new_attempt()
+                elif tracker.check_timeout():
+                    pause(tracker.error)
+                    if save: save(image,tracker.error)
+                continue
+            if tracker.paused or not entered: continue
+            if tracker.phase == 'dialog':
+                if obs.page != 'abandon_dialog' or obs.buttons[2] != 'enabled':
+                    pause('expected abandon dialog no longer aligned')
+                    continue
+                action,context,button = Action.CONFIRM,last_hand,'confirm'
+            else:
+                if (not valid_observation(obs) or obs.slots != last_hand.slots or obs.inventory != last_hand.inventory):
+                    pause('unexplained or unknown state; manual reconciliation required')
+                    continue
+                action = Action.DRAW if decision == Decision.DRAW else Action.ABANDON
+                context,button = obs,'draw' if action == Action.DRAW else 'abandon'
+                if obs.buttons[0 if action == Action.DRAW else 1] != 'enabled': continue
             handle_keys()
-            return not tracker.paused and not tracker.terminated and not tracker.candidate and time.monotonic()-stamp <= .5
-        def submit(action_id):
-            emit({'event':'input_intent','id':action_id,'action':action.value,
-                  'attempt':counters['attempts_confirmed'],'observation':asdict(obs),'timings':timings.summary()})
-            return perform(profile.regions[button],permitted)
-        action_id = tracker.send(action,context,submit,early_restart=timings.early_restart)
-        if action_id is None:
-            if tracker.terminated: break
-            pause('input cancelled: stop, pause, stale observation or focus change')
-            continue
-        if action == Action.DRAW: counters['draw_clicks_sent'] += 1
-        emit({'event':'input_sent','id':action_id,'action':action.value})
-    if paused_started is not None: pause_total += now[0]-paused_started
-    return {'event':'summary','termination_reason':reason,**counters,'timings':timings.summary(),
-            'elapsed':None if active_started is None else now[0]-active_started,'paused_seconds':pause_total}
+            if tracker.paused or tracker.terminated or time.monotonic()-stamp > .5: continue
+            cycle_started = stamp
+            if action == Action.ABANDON:
+                reset_started = stamp
+                cycle_clean = True
+            elif action == Action.DRAW:
+                cycle_clean = True
+            def permitted():
+                handle_keys()
+                return not tracker.paused and not tracker.terminated and not tracker.candidate and time.monotonic()-stamp <= .5
+            def submit(action_id):
+                emit({'event':'input_intent','id':action_id,'action':action.value,
+                      'attempt':counters['attempts_confirmed'],'observation':asdict(obs),'timings':timings.summary()})
+                return perform(profile.regions[button],permitted)
+            action_id = tracker.send(action,context,submit,early_restart=timings.early_restart)
+            if action_id is None:
+                if tracker.terminated: break
+                pause('input cancelled: stop, pause, stale observation or focus change')
+                continue
+            if action == Action.DRAW: counters['draw_clicks_sent'] += 1
+            emit({'event':'input_sent','id':action_id,'action':action.value})
+    except KeyboardInterrupt:
+        reason = 'Ctrl+C'
+        raise
+    except Exception as error:
+        reason = 'error: '+str(error)
+        raise
+    finally:
+        if paused_started is not None: pause_total += now[0]-paused_started
+        result = {'event':'summary','termination_reason':reason,**counters,'timings':timings.summary(),
+                  'elapsed':None if active_started is None else now[0]-active_started,'paused_seconds':pause_total,
+                  'last_observation':asdict(last_observation) if last_observation is not None else None,
+                  'pending_action':{'id':tracker.pending[0],'action':tracker.pending[1].value} if tracker.pending else None}
+        emit(result)
+    return result
 
 def validate(profile, dataset):
     """Evaluate independently labelled batches and observed single-draw/early-reset paths."""
@@ -486,9 +507,8 @@ def main(argv=None):
             for frame in frames:
                 if frame[2] is not None: last_image = frame[2]
                 yield frame
-        summary = drive(profile,remember(),mode=mode,emit=emit,keys=keys.poll if keys else None,
+        drive(profile,remember(),mode=mode,emit=emit,keys=keys.poll if keys else None,
                         perform=perform,save=(lambda image,reason:evidence(profile,image,reason)) if live else None)
-        emit(summary)
         if live:
             import winsound
             winsound.MessageBeep()

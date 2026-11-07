@@ -7,11 +7,60 @@ import json
 from io import StringIO
 from unittest.mock import Mock, patch
 import numpy as np
+import collect_observation
 from ake import main, validate
 from ake_core import Observation
 from vision import VisionProfile, classify, recognize_card, segment_digits, normalize_digit, recognize_stock, read_image, write_image
 
 class VisionTests(unittest.TestCase):
+    def test_recording_preserves_calibration_geometry_and_masks_account_strip(self):
+        binding = Mock(client=(20,30,100,100),hwnd=1)
+        source = np.random.default_rng(7).integers(0,256,(100,100,4),dtype=np.uint8)
+        frames = []
+        writer = Mock()
+        writer.isOpened.return_value = True
+        writer.write.side_effect = lambda frame:frames.append(frame.copy())
+        capture = Mock()
+        capture.grab.return_value = source
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            with patch('sys.argv',['collect_observation.py','--seconds','1','--fps','5']), \
+                 patch('sys.stdout',new_callable=StringIO), \
+                 patch('collect_observation.find_unique',return_value=binding), \
+                 patch('collect_observation.snapshot',return_value=binding), \
+                 patch('collect_observation.foreground_matches',return_value=True), \
+                 patch('collect_observation.Path',return_value=root/'captures'), \
+                 patch('collect_observation.cv2.VideoWriter',return_value=writer) as create_writer, \
+                 patch('collect_observation.mss.mss') as mss, \
+                 patch('collect_observation.time.monotonic',side_effect=[0,0,.1,.2,1.1]), \
+                 patch('collect_observation.time.sleep'):
+                mss.return_value.__enter__.return_value = capture
+                collect_observation.main()
+            self.assertEqual(create_writer.call_args.args[-1],(100,100))
+            capture.grab.assert_called_once_with({'left':20,'top':30,'width':100,'height':100})
+            self.assertEqual(len(frames),1)
+            self.assertEqual(frames[0].shape,(100,100,3))
+            np.testing.assert_array_equal(frames[0][:95],source[:95,:,:3])
+            self.assertFalse(np.any(frames[0][95:]))
+            writer.release.assert_called_once()
+            profile_path = root/'profile.json'
+            profile_path.write_text(json.dumps({'frame_size':[100,100],
+                'regions':{'slots':[[5,5,20,20]]*5},'groups':{},'anchors':{}}),encoding='utf-8')
+            VisionProfile(profile_path).add_sample(frames[0],'cards','5',0,0,.95,.1,'fixture')
+            self.assertIn('5',VisionProfile(profile_path).groups['cards'][0])
+
+    def test_recording_rejects_odd_geometry_without_cropping(self):
+        for size in ((101,100),(100,101)):
+            with self.subTest(size=size), \
+                 patch('sys.argv',['collect_observation.py','--seconds','1']), \
+                 patch('collect_observation.find_unique',return_value=Mock(client=(0,0,*size))), \
+                 patch('collect_observation.cv2.VideoWriter') as create_writer, \
+                 patch('collect_observation.mss.mss') as mss:
+                with self.assertRaisesRegex(SystemExit,'even client width and height'):
+                    collect_observation.main()
+                create_writer.assert_not_called()
+                mss.assert_not_called()
+
     def test_uninformative_sample_preserves_existing_profile(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)

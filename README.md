@@ -43,6 +43,8 @@ python ake.py run --live --profile calibration.local.json --qualification logs/q
 
 `run` 默认 dry-run，只提出建议，不记录假点击或等待假结果。同一状态不反复输出。`observe` 和 dry-run 用 Ctrl+C 结束；replay 不初始化 Windows 输入或热键。旧实验工具 `replay_cards.py` 已被统一的 `ake.py replay` 取代。
 
+运行开始后，正常结束、Ctrl+C 和采集/识别异常都会输出一次 `summary`，包含终止原因、计数、时间、最后一次观察及 `pending_action`；未确认的发送不能当作已抽到的牌。异常仍返回失败退出码，不会因输出摘要而被当作成功。
+
 独立标注文件每行一个 JSON，必须注明 `source: "real"`、与 `training_batches` 不同的 `batch`、相对标注文件的 `image` 路径，以及 `expected` 中完整的 `slots`、`inventory`、`game_round`、`page`、`buttons`。空槽为 0、未知为 null；page 为 `hand/abandon_dialog/unknown`；buttons 按抽牌、放弃、确认排列，值为 `enabled/disabled/null`。同一批次内需覆盖一次新增一张的变化和未抽满放弃→弹窗→第一轮空牌面、初始库存恢复。校准集与验收集必须按完整采集批次分开；不能改写报告来绕过缺失素材。
 
 验证集还必须包含未知页、手牌页的未知牌槽和未知库存反例，程序读数须逐字段符合标注；只有正常静止正例不能通过。旧报告未记录这三类拒绝识别检查时，需重新运行 `validate`，即使模板指纹相同也不能用于自动启动。
@@ -54,6 +56,8 @@ python ake.py run --live --profile calibration.local.json --qualification logs/q
 ## 日志、限制与打包
 
 事件日志为 `logs/events.jsonl`，每条含本地带时区时间 `time` 和单调时钟 `monotonic`，每卷 2 MB、最多 3 个备份。成功/错误证据只保存配置的牌槽和库存区域，位于 `logs/evidence`。录屏可能包含其他软件的浮窗；原始录像、模板、日志和校准文件都不上传。证据文件单独保留，需要用户定期归档。
+
+`collect_observation.py` 保留完整客户区尺寸，并把当前已核对布局中包含 UID 的底部 5% 遮黑，保持录像与校准坐标一致。编码要求客户区宽高为偶数；奇数尺寸会明确拒绝，需调整窗口并重新校准。旧的裁高录像应使用符合其实际尺寸的单独布局。回放会核对连续帧号、有限递增时间戳及视频/CSV 一一对应，数据不完整时明确报错。
 
 缺模板、库存不一致、窗口身份变化和验证失败均应先检查素材和校准，不应提高点击频率。首次接管非空手牌只读提示，用户手动返回空牌面后再启动。当前缺少完整库存字符、第二轮及独立实机验收素材，尚不能宣称当前电脑可可靠自动运行。
 
