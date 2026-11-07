@@ -8,6 +8,11 @@ from threading import Event, Thread
 import tkinter as tk
 from tkinter import filedialog, ttk
 
+BACKENDS = {
+    'vision': ('识别', {'auto':'自动', 'cuda':'CUDA', 'cpu':'CPU'}),
+    'capture': ('截图', {'auto':'自动', 'mss':'MSS', 'dxgi':'DXGI'}),
+    'input': ('点击', {'auto':'自动', 'sendinput':'系统鼠标', 'window-message':'窗口消息'}),
+}
 
 def launch(main):
     home = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
@@ -23,11 +28,15 @@ def launch(main):
     report = Path('logs/qualification.json')
     paths = {'profile': Path('calibration.local.json'),
              'validation': report if report.is_file() else Path('independent.jsonl')}
+    modes = {key: tk.StringVar(value='auto') for key in BACKENDS}
     settings_error = ''
     if settings.is_file():
         try:
             saved = json.loads(settings.read_text(encoding='utf-8'))
             paths = {key: Path(saved[key]) for key in paths}
+            for key, value in saved.get('backends',{}).items():
+                if key in BACKENDS and value in BACKENDS[key][1]:
+                    modes[key].set(value)
         except (OSError, ValueError, KeyError, TypeError) as error:
             settings_error = f'无法读取上次的选择，请重新选择资料。\n{error}'
 
@@ -47,6 +56,8 @@ def launch(main):
     setup.grid(row=5, column=0, sticky='w', pady=(6, 0))
     ttk.Label(panel, text='游戏内 F8 开始或暂停　·　F9 结束', foreground='#555555').grid(
         row=6, column=0, sticky='w', pady=(14, 0))
+    backend_status = tk.StringVar()
+    ttk.Label(panel,textvariable=backend_status,wraplength=460).grid(row=7,column=0,sticky='w')
 
     messages = Queue()
     stop = Event()
@@ -66,11 +77,14 @@ def launch(main):
         end.configure(state='normal' if working and not stop.is_set() else 'disabled')
         return profile_ok and validation_ok
 
-    def remember(key, path):
+    def remember(key=None, path=None):
         from vision import VisionProfile
-        selection = {**paths, key: path}
+        selection = dict(paths)
+        if key:
+            selection[key] = path.relative_to(home) if path.is_relative_to(home) else path
         settings.parent.mkdir(exist_ok=True)
-        VisionProfile.save_config(settings, {k: str(v) for k, v in selection.items()})
+        VisionProfile.save_config(settings, {**{k: str(v) for k, v in selection.items()},
+                                             'backends':{k:v.get() for k,v in modes.items()}})
         paths.update(selection)
 
     def ready():
@@ -105,6 +119,9 @@ def launch(main):
         success_text = ''
         stop.clear()
         refresh()
+        selected = {key:var.get() for key,var in modes.items()}
+        actual.clear()
+        backend_status.set('')
         if operation == 'record':
             title.set('请在 30 秒内切回游戏')
             detail.set('从第一轮空牌面开始，手动抽一张，再演示放弃、确认和回到空牌面。每步等画面稳定。出现四张 5 时保留牌面。')
@@ -120,7 +137,9 @@ def launch(main):
                 if operation == 'record':
                     from collect_observation import record
                     result = record(on_start=lambda path: messages.put(('recording', path)),
-                                    stopped=stop.is_set)
+                                    stopped=stop.is_set,backend=selected['capture'],
+                                    on_backend=lambda name,reason: messages.put(('event',{'event':'backend',
+                                        'component':'capture','actual':name,'reason':reason})))
                 elif operation == 'bind':
                     bound.parent.mkdir(exist_ok=True)
                     result = main(['calibrate', '--layout', str(paths['profile']), '--rebind',
@@ -128,7 +147,8 @@ def launch(main):
                 else:
                     source = paths['validation']
                     flag = '--dataset' if source.suffix.lower() == '.jsonl' else '--qualification'
-                    result = main(['run', '--live', '--profile', str(paths['profile']), flag, str(source)],
+                    options = [arg for key,value in selected.items() for arg in ('--'+key+'-backend',value)]
+                    result = main(['run', '--live', '--profile', str(paths['profile']), flag, str(source),*options],
                                   output=lambda event: messages.put(('event', event)), stopped=stop.is_set)
                 messages.put(('done', result))
             except Exception as error:
@@ -161,7 +181,12 @@ def launch(main):
     def show(event):
         nonlocal success_text
         kind = event.get('event')
-        if kind == 'armed':
+        if kind == 'backend':
+            key, name = event['component'],event['actual']
+            label, choices = BACKENDS[key]
+            actual[key] = label+' '+choices.get(name,name)
+            backend_status.set('　'.join(actual.values()))
+        elif kind == 'armed':
             title.set('可以开始抽牌')
             detail.set('切回游戏的第一轮空牌面，按 F8 开始。')
         elif kind == 'resumed':
@@ -181,6 +206,9 @@ def launch(main):
             elif reason == 'observation or action readiness timed out':
                 title.set('已暂停，牌面识别或按钮等待超时')
                 detail.set('检查游戏画面是否被遮挡，等动画结束、按钮可用后按 F8。')
+            elif reason == 'unexpected game round or abandon dialog':
+                title.set('已暂停，轮次或放弃弹窗与上一步不符')
+                detail.set('请核对游戏画面。回到预期牌面后，按 F8 重新核对。')
             else:
                 title.set('已暂停')
                 detail.set('确认游戏画面后按 F8 恢复，或按 F9 结束。')
@@ -258,6 +286,22 @@ def launch(main):
     button(setup, '选择识别配置', lambda: choose('profile'))
     button(setup, '选择验收素材', lambda: choose('validation'))
     rebind = button(setup, '重新绑定游戏', lambda: run('bind'))
+    actual = {}
+    compatibility = ttk.Menubutton(setup,text='运行方式')
+    menu = tk.Menu(compatibility,tearoff=False)
+    def save_modes():
+        try:
+            remember()
+        except OSError as error:
+            title.set('运行方式只在本次打开期间生效')
+            detail.set(str(error))
+    for key,(label,choices) in BACKENDS.items():
+        group = tk.Menu(menu,tearoff=False)
+        for name,display in choices.items():
+            group.add_radiobutton(label=display,value=name,variable=modes[key],command=save_modes)
+        menu.add_cascade(label=label,menu=group)
+    compatibility.configure(menu=menu)
+    compatibility.pack(side='left')
     root.protocol('WM_DELETE_WINDOW', close)
     ready()
     if settings_error:

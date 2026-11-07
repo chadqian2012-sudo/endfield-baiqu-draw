@@ -1,4 +1,4 @@
-"""Windows window identity, hotkeys and the single mouse-input backend."""
+"""Windows window identity, hotkeys and foreground-only mouse delivery."""
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -82,9 +82,13 @@ def find_unique(title='Endfield'):
     if len(found) != 1: raise RuntimeError(f'expected one matching window, found {len(found)}')
     return snapshot(found[0])
 
-def foreground_matches(binding):
+def foreground_matches(binding, *, require_identity=False):
     u,_ = _api()
-    return snapshot(binding.hwnd) == binding and u.GetForegroundWindow() == binding.hwnd
+    if snapshot(binding.hwnd) != binding:
+        if require_identity:
+            raise RuntimeError('window identity, geometry or DPI changed; recalibrate')
+        return False
+    return u.GetForegroundWindow() == binding.hwnd
 
 class Hotkeys:
     """Thread-owned F8/F9 registrations. Construction must precede live input."""
@@ -112,44 +116,115 @@ class Hotkeys:
             self.u.UnregisterHotKey(None,key)
         self.registered.clear()
 
-def click(binding, region, permitted):
-    """Send one complete click after the caller's final state/stop check.
+class _MouseInput(ctypes.Structure):
+    _fields_ = [('dx',wintypes.LONG),('dy',wintypes.LONG),('data',wintypes.DWORD),
+                ('flags',wintypes.DWORD),('time',wintypes.DWORD),('extra',ctypes.c_size_t)]
 
-    Foreground checking and OS submission are not atomic. A partial submission
-    is an error; only an inserted left-button-down may be followed by release.
-    """
-    u,_ = _api()
-    x,y,w,h = region
-    if min(x,y) < 0 or min(w,h) <= 0 or x+w > binding.client[2] or y+h > binding.client[3]:
-        raise ValueError('click region outside client')
-    class Mouse(ctypes.Structure):
-        _fields_ = [('dx',wintypes.LONG),('dy',wintypes.LONG),('data',wintypes.DWORD),
-                    ('flags',wintypes.DWORD),('time',wintypes.DWORD),('extra',ctypes.c_size_t)]
-    class Payload(ctypes.Union):
-        _fields_ = [('mouse',Mouse)]
-    class Input(ctypes.Structure):
-        _fields_ = [('type',wintypes.DWORD),('payload',Payload)]
-    u.SendInput.argtypes = [wintypes.UINT,ctypes.POINTER(Input),ctypes.c_int]
-    u.SendInput.restype = wintypes.UINT
-    u.GetSystemMetrics.argtypes = [ctypes.c_int]
-    left,top,sw,sh = (u.GetSystemMetrics(i) for i in (76,77,78,79))
-    sx,sy = binding.client[0]+x+w//2,binding.client[1]+y+h//2
-    if sw <= 1 or sh <= 1 or not left <= sx < left+sw or not top <= sy < top+sh:
-        raise RuntimeError('invalid virtual screen geometry')
-    events = (Input*3)()
-    events[0].payload.mouse = Mouse(round((sx-left)*65535/(sw-1)),round((sy-top)*65535/(sh-1)),0,0xC001,0,0)
-    events[1].payload.mouse.flags = 0x0002
-    events[2].payload.mouse.flags = 0x0004
-    if not foreground_matches(binding) or not permitted():
-        return False
-    count = u.SendInput(3,events,ctypes.sizeof(Input))
-    if count == 2:
-        release = Input()
-        release.payload.mouse.flags = 0x0004
-        u.SendInput(1,ctypes.byref(release),ctypes.sizeof(Input))
-    if count != 3:
-        raise RuntimeError(f'partial or blocked input: {count}/3 events; do not retry')
-    return True
+
+class _Input(ctypes.Structure):
+    _fields_ = [('type',wintypes.DWORD),('mouse',_MouseInput)]
+
+
+class MouseExecutor:
+    """on_backend reports the selected delivery method, never a game acknowledgement."""
+    BACKENDS = ('auto','sendinput','window-message')
+
+    def __init__(self,binding,*,backend='auto',on_backend=None):
+        if backend not in self.BACKENDS:
+            raise ValueError('unknown mouse backend: '+str(backend))
+        self.binding = binding
+        self.automatic = backend == 'auto'
+        self.backend = 'sendinput' if self.automatic else backend
+        self.on_backend = on_backend
+        self.u,_ = _api()
+        u = self.u
+        u.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u.WindowFromPoint.argtypes = [wintypes.POINT]
+        u.WindowFromPoint.restype = wintypes.HWND
+        u.IsChild.argtypes = [wintypes.HWND,wintypes.HWND]
+        u.ScreenToClient.argtypes = [wintypes.HWND,ctypes.POINTER(wintypes.POINT)]
+        u.PostMessageW.argtypes = [wintypes.HWND,wintypes.UINT,wintypes.WPARAM,wintypes.LPARAM]
+        u.SendInput.argtypes = [wintypes.UINT,ctypes.POINTER(_Input),ctypes.c_int]
+        u.SendInput.restype = wintypes.UINT
+        if on_backend:
+            on_backend(self.backend,'preferred' if self.automatic else 'selected')
+
+    def _owns(self,hwnd):
+        pid = wintypes.DWORD()
+        return bool(hwnd and (hwnd == self.binding.hwnd or self.u.IsChild(self.binding.hwnd,hwnd))
+                    and self.u.GetWindowThreadProcessId(hwnd,ctypes.byref(pid)) and pid.value == self.binding.pid)
+
+    def _target(self,point,permitted):
+        if not foreground_matches(self.binding):
+            return None
+        target = self.u.WindowFromPoint(point)
+        if not self._owns(target):
+            return None
+        client,rect = wintypes.POINT(point.x,point.y),wintypes.RECT()
+        if not (self.u.ScreenToClient(target,ctypes.byref(client)) and self.u.GetClientRect(target,ctypes.byref(rect))):
+            return None
+        if not (0 <= client.x < rect.right and 0 <= client.y < rect.bottom):
+            return None
+        if permitted() and self.u.GetForegroundWindow() == self.binding.hwnd and self.u.WindowFromPoint(point) == target:
+            return target,client.x,client.y
+        return None
+
+    def __call__(self,region,permitted):
+        x,y,w,h = region
+        left,top,width,height = self.binding.client
+        if min(x,y) < 0 or min(w,h) <= 0 or x+w > width or y+h > height:
+            raise ValueError('click region outside client')
+        point = wintypes.POINT(left+x+w//2,top+y+h//2)
+        if self.backend == 'sendinput':
+            left,top,sw,sh = (self.u.GetSystemMetrics(i) for i in (76,77,78,79))
+            if sw <= 1 or sh <= 1 or not left <= point.x < left+sw or not top <= point.y < top+sh:
+                raise RuntimeError('invalid virtual screen geometry')
+            events = (_Input*3)()
+            events[0].mouse = _MouseInput(((point.x-left)*65536+32768)//sw,((point.y-top)*65536+32768)//sh,
+                                          0,0xC001,0,0)
+            events[1].mouse.flags = 0x0002
+            events[2].mouse.flags = 0x0004
+            if not self._target(point,permitted):
+                return False
+            ctypes.set_last_error(0)
+            count = self.u.SendInput(3,events,ctypes.sizeof(_Input))
+            error = ctypes.get_last_error()
+            if count == 3:
+                return True
+            if count == 2:
+                if self.u.SendInput(1,ctypes.byref(events[2]),ctypes.sizeof(_Input)) != 1:
+                    raise RuntimeError('SendInput accepted down but release failed; stop')
+            # A zero count alone does not distinguish UIPI from other failures.
+            if not (count == 0 and self.automatic and error in (50,120)):
+                raise RuntimeError(f'SendInput inserted {count}/3 events (WinError {error}); do not retry')
+            self.backend = 'window-message'
+            if self.on_backend:
+                self.on_backend(self.backend,f'SendInput unsupported (WinError {error}); zero events inserted')
+
+        hit = self._target(point,permitted)
+        if not hit:
+            return False
+        target,cx,cy = hit
+        if cx > 32767 or cy > 32767:
+            raise ValueError('mouse message outside signed client coordinates')
+        lparam = cx | cy << 16
+        release_required = True
+        try:
+            if not self.u.PostMessageW(target,0x0201,1,lparam):
+                release_required = False
+                raise ctypes.WinError(ctypes.get_last_error(),'mouse down was not queued')
+            aligned = self._target(point,permitted) == hit
+        finally:
+            # An interruption in PostMessageW can leave the down outcome unknown.
+            if release_required and (not self._owns(target) or not self.u.PostMessageW(target,0x0202,0,lparam)):
+                raise RuntimeError('mouse down was queued but release could not be confirmed; do not retry')
+        if not aligned:
+            raise RuntimeError('target changed or stopped after mouse down; released without retry')
+        return True
+
+
+def click(binding,region,permitted):
+    return MouseExecutor(binding,backend='sendinput')(region,permitted)
 
 if __name__ == '__main__':
     binding = find_unique()

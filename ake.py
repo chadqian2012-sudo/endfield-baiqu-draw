@@ -18,7 +18,7 @@ from math_verify import threshold, totals
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, initial, draw_completed
 from timing import Timings
 
-VERSION = '0.3.0'
+VERSION = '0.4.0'
 REJECTION_CASES = {'unknown_page','unknown_slot','unknown_inventory'}
 
 def fingerprint(profile):
@@ -70,20 +70,14 @@ def frames_from_recording(recording):
     finally:
         video.release()
 
-def frames_from_window(binding, seconds):
-    import mss
-    import numpy as np
-    from windowing import snapshot, foreground_matches
+def frames_from_window(binding, seconds, *, backend='auto', on_backend=None):
+    from capture import WindowCapture
     start = time.monotonic()
-    x,y,w,h = binding.client
-    with mss.mss() as capture:
+    with WindowCapture(binding, backend, on_backend) as capture:
         sequence = 0
         while seconds is None or time.monotonic()-start < seconds:
             tick = time.monotonic()
-            if snapshot(binding.hwnd) != binding:
-                raise RuntimeError('window identity, geometry or DPI changed; recalibrate')
-            focused = foreground_matches(binding)
-            image = np.asarray(capture.grab({'left':x,'top':y,'width':w,'height':h}))[:,:,:3].copy() if focused else None
+            image,focused = capture.grab()
             yield sequence,tick,image,focused
             sequence += 1
             time.sleep(max(0,.12-(time.monotonic()-tick)))
@@ -97,6 +91,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     timings = Timings()
     last_hand = None
     last_observation = None
+    last_image = None
     last_output = None
     entered = False
     cycle_started = reset_started = None
@@ -135,7 +130,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                         pause_total += now[0]-paused_started
                         paused_started = None
                     stabilizer.resume(now[0])
-                    emit({'event':'resumed'})
+                    emit({'event':'suspected_success' if tracker.candidate else 'resumed'})
                 else:
                     emit({'event':'paused','reason':'pending action or success candidate requires reconciliation'})
             else:
@@ -149,6 +144,10 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             emit({'event':'strategy','attempt':counters['attempts_confirmed'],'early_restart':timings.early_restart})
             last_policy = timings.early_restart
 
+    def save_pause(image, reason):
+        if save and last_image is not None:
+            save(last_image,reason if image is not None else reason+' (last available frame)')
+
     try:
         if mode == 'live': emit({'event':'armed','message':'F8 start/pause, F9 terminal stop'})
         for sequence,stamp,image,focused in frames:
@@ -161,10 +160,15 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 if mode == 'live' and not tracker.paused:
                     pause('focus lost; F8 required after reconciliation')
                 continue
-            obs,quality = profile.read(image)
+            stable_obs = None
+            if image is not None:
+                obs,quality = profile.read(image)
+                last_observation,last_image = obs,image
             observed_at = now[0] = clock()
-            last_observation = obs
-            stable_obs = stabilizer.add(Frame(sequence,stamp,obs),observed_at)
+            if image is not None:
+                stable_obs = stabilizer.add(Frame(sequence,stamp,obs),observed_at)
+            else:
+                stabilizer.frames.clear()
             tracker.candidate = stabilizer.candidate_since is not None
             decision = decide(stable_obs,timings.early_restart) if stable_obs is not None else Decision.WAIT
             if decision == Decision.SUCCESS:
@@ -178,21 +182,27 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             if mode == 'live' and stabilizer.candidate_timed_out(observed_at,tracker.timeout):
                 reason = 'suspected success; confirmation timeout'
                 pause(reason)
-                if save: save(image,reason)
+                save_pause(image,reason)
                 break
             if (mode == 'live' and not tracker.paused and not tracker.pending and not tracker.candidate
                     and cycle_started is not None and observed_at-cycle_started >= tracker.timeout):
                 pause('observation or action readiness timed out')
-                if save: save(image,'observation or action readiness timed out')
+                save_pause(image,'observation or action readiness timed out')
                 continue
             if mode == 'live' and not tracker.candidate and tracker.check_timeout():
                 pause(tracker.error)
-                if save: save(image,tracker.error)
+                save_pause(image,tracker.error)
             if stable_obs is None: continue
             if tracker.candidate:
                 if last_output != 'candidate':
                     emit({'event':'suspected_success','reason':'input frozen; awaiting consistent inventory'})
                     last_output = 'candidate'
+                continue
+            expecting_dialog = tracker.phase == 'dialog' or (tracker.pending and tracker.pending[1] == Action.ABANDON)
+            if (mode == 'live' and not tracker.paused and
+                    (obs.game_round == 2 or (obs.page == 'abandon_dialog' and not expecting_dialog))):
+                pause('unexpected game round or abandon dialog')
+                save_pause(image,'unexpected game round or abandon dialog')
                 continue
             if not entered:
                 if initial(obs):
@@ -315,12 +325,22 @@ def validate(profile, dataset, *, stopped=None):
         if stopped and stopped():
             raise InterruptedError('已停止核对素材。')
 
-    def compatible(obs, hands):
-        return obs.page == 'unknown' or (obs.page == 'hand' and obs.game_round in (None,1)
-                and all(value is None or any(value == hand.slots[i] for hand in hands)
-                        for i,value in enumerate(obs.slots))
-                and all(value is None or any(value == hand.inventory[i] for hand in hands)
-                        for i,value in enumerate(obs.inventory)))
+    def follows_hand_change(frames, before, after, *, dialog_open=False):
+        # Slots and stock may update in different frames. Each known field moves
+        # toward its final value; an unknown frame does not erase earlier readings.
+        last = list(before.slots + before.inventory)
+        target = after.slots + after.inventory
+        for obs in frames:
+            if obs.page == 'unknown' or (dialog_open and obs.page == 'abandon_dialog'):
+                continue
+            if obs.page != 'hand' or obs.game_round not in (None,1):
+                return False
+            dialog_open = False
+            for i,value in enumerate(obs.slots + obs.inventory):
+                if value is not None:
+                    if value not in (last[i],target[i]): return False
+                    last[i] = value
+        return True
 
     with dataset.open(encoding='utf-8-sig') as f, ExitStack() as cleanup:
         for line_number,line in enumerate(f,1):
@@ -398,13 +418,12 @@ def validate(profile, dataset, *, stopped=None):
                       and valid_observation(a) and 0 < sum(v != 0 for v in a.slots) < 5
                       and a.buttons[1] == 'enabled' and b.page == 'abandon_dialog'
                       and b.buttons[2] == 'enabled' and initial(c)
-                      and all(compatible(obs,(a,)) for obs in recordings[ra][1][sa:sb])
-                      and all(obs.page == 'abandon_dialog' or compatible(obs,(a,c))
-                              for obs in recordings[ra][1][sb:sc+1])
+                      and follows_hand_change(recordings[ra][1][sa:sb],a,a)
+                      and follows_hand_change(recordings[ra][1][sb:sc+1],a,c,dialog_open=True)
                       for (ba,ra,sa,a),(bb,rb,sb,b),(bc,rc,sc,c) in zip(history,history[1:],history[2:]))
     single_draw = any(ra is not None and ra == rb and sa < sb and ba == bb
                       and a.buttons[0] == 'enabled' and draw_completed(a,b)
-                      and all(compatible(obs,(a,b)) for obs in recordings[ra][1][sa:sb+1])
+                      and follows_hand_change(recordings[ra][1][sa:sb+1],a,b)
                       for (ba,ra,sa,a),(bb,rb,sb,b) in zip(history,history[1:]))
     for name,classes in profile.CLASSES.items():
         missing = classes-coverage[name]
@@ -434,10 +453,12 @@ def main(argv=None, *, output=None, stopped=None):
     a.add_argument('--round',type=int,required=True)
     a.add_argument('--early-restart',action='store_true')
     c = commands.add_parser('calibrate')
+    capture_commands = [c]
     c.add_argument('--layout',type=Path)
     c.add_argument('--rebind',action='store_true',help='bind an existing layout to the same game, size and DPI')
     c.add_argument('--output',type=Path,default=Path('calibration.local.json'))
     c = commands.add_parser('sample')
+    capture_commands.append(c)
     c.add_argument('--profile',type=Path,required=True)
     c.add_argument('--group',choices=('cards','stock','round','draw','abandon','confirm','hand','abandon_dialog'),required=True)
     c.add_argument('--label')
@@ -451,21 +472,30 @@ def main(argv=None, *, output=None, stopped=None):
     sources.add_argument('--recording',type=Path)
     c.add_argument('--at',type=float,default=0)
     c = commands.add_parser('validate')
+    vision_commands = [c]
     c.add_argument('--profile',type=Path,required=True)
     c.add_argument('--dataset',type=Path,required=True)
     c.add_argument('--output',type=Path,default=Path('logs/qualification.json'))
     for name in ('observe','run','replay'):
         c = commands.add_parser(name)
+        vision_commands.append(c)
         c.add_argument('--profile',type=Path,required=True)
         if name == 'replay': c.add_argument('recording',type=Path)
-        else: c.add_argument('--seconds',type=float)
+        else:
+            capture_commands.append(c)
+            c.add_argument('--seconds',type=float)
         if name == 'run':
+            c.add_argument('--input-backend',choices=('auto','sendinput','window-message'),default='auto')
             group = c.add_mutually_exclusive_group()
             group.add_argument('--dry-run',action='store_true')
             group.add_argument('--live',action='store_true')
             sources = c.add_mutually_exclusive_group()
             sources.add_argument('--qualification',type=Path)
             sources.add_argument('--dataset',type=Path,help='verify the independently labelled source directly')
+    for command in capture_commands:
+        command.add_argument('--capture-backend',choices=('auto','mss','dxgi'),default='auto')
+    for command in vision_commands:
+        command.add_argument('--vision-backend',choices=('auto','cuda','cpu'),default='auto')
     args = p.parse_args(argv)
     if args.command == 'math':
         for name,early in [('baseline',False),('early_restart',True)]:
@@ -483,6 +513,18 @@ def main(argv=None, *, output=None, stopped=None):
         publish(analysis)
         return 0
     from vision import VisionProfile
+    backend_output = publish
+    active_backends = {}
+
+    def backend_event(component):
+        def selected(actual, reason):
+            active_backends[component] = actual
+            backend_output({'event':'backend','component':component,'actual':actual,'reason':reason})
+        return selected
+
+    def window_frames(binding, seconds):
+        return frames_from_window(binding,seconds,backend=args.capture_backend,on_backend=backend_event('capture'))
+
     if args.command == 'calibrate':
         from windowing import find_unique
         if args.rebind and not args.layout:
@@ -491,7 +533,7 @@ def main(argv=None, *, output=None, stopped=None):
         if args.layout is None:
             import cv2
             publish({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
-            frame = next((image for _,_,image,focused in frames_from_window(binding,10) if focused),None)
+            frame = next((image for _,_,image,focused in window_frames(binding,10) if focused and image is not None),None)
             if frame is None: raise ValueError('foreground game capture timed out')
             config = {'frame_size':list(binding.client[2:]),'regions':{},'groups':{},'anchors':{},'training_batches':[]}
             try:
@@ -537,7 +579,7 @@ def main(argv=None, *, output=None, stopped=None):
         VisionProfile.save_config(args.output,config)
         publish({'calibration':str(args.output),'issues':profile.issues()})
         return 0
-    profile = VisionProfile(args.profile)
+    profile = VisionProfile(args.profile,backend=getattr(args,'vision_backend','auto'),on_backend=backend_event('vision'))
     if args.command == 'sample':
         import cv2
         from vision import read_image
@@ -557,13 +599,17 @@ def main(argv=None, *, output=None, stopped=None):
             if json.loads(json.dumps(asdict(binding))) != profile.config.get('window'):
                 raise ValueError('sample requires calibrated window')
             publish({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
-            image = next((image for _,_,image,focused in frames_from_window(binding,10) if focused),None)
+            image = next((image for _,_,image,focused in window_frames(binding,10) if focused and image is not None),None)
             if image is None: raise ValueError('foreground game capture timed out')
         profile.add_sample(image,args.group,args.label,args.index,args.digit,args.score,args.margin,args.batch)
         publish({'sample_saved':True,'issues':VisionProfile(args.profile).issues()})
         return 0
     if args.command == 'validate':
         report = validate(profile,args.dataset)
+        # Keep a report with its source when the local profile directory is moved.
+        dataset, destination = args.dataset.resolve(), args.output.resolve().parent
+        if dataset.is_relative_to(profile.path.parent) and destination.is_relative_to(profile.path.parent):
+            report['dataset'] = os.path.relpath(dataset,destination)
         args.output.parent.mkdir(parents=True,exist_ok=True)
         args.output.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
         publish(report)
@@ -589,23 +635,26 @@ def main(argv=None, *, output=None, stopped=None):
         Path('logs').mkdir(exist_ok=True)
         handler = StrictLog('logs/events.jsonl',maxBytes=2_000_000,backupCount=3,encoding='utf-8')
         def emit(event):
+            if event.get('event') in ('armed','summary'):
+                event = {**event,'backends':dict(active_backends)}
             event = {'time':datetime.now().astimezone().isoformat(),'monotonic':time.monotonic(),**event}
             publish(event)
             handler.emit(logging.LogRecord('ake',logging.INFO,'',0,json.dumps(event,ensure_ascii=False),(),None))
+        backend_output = emit
         if args.command == 'replay':
             frames = frames_from_recording(args.recording)
             mode,perform = 'replay',None
         else:
-            from windowing import find_unique, Hotkeys, click
+            from windowing import find_unique, Hotkeys, MouseExecutor
             if stopped and stopped(): return 0
             binding = find_unique()
             expected = profile.config.get('window')
             if not expected or json.loads(json.dumps(asdict(binding))) != expected:
                 raise ValueError('window is not the calibrated process; run calibrate again')
-            frames = frames_from_window(binding,args.seconds)
+            frames = window_frames(binding,args.seconds)
             mode = 'live' if live else 'observe' if args.command == 'observe' else 'dry-run'
             if live: keys = Hotkeys()
-            perform = (lambda region,permitted:click(binding,region,permitted)) if live else None
+            perform = MouseExecutor(binding,backend=args.input_backend,on_backend=backend_event('input')) if live else None
         def remember():
             nonlocal last_image
             for frame in frames:
@@ -640,6 +689,8 @@ def main(argv=None, *, output=None, stopped=None):
         if handler: handler.close()
 
 if __name__ == '__main__':
+    from multiprocessing import freeze_support
+    freeze_support()
     try:
         sys.exit(main())
     except KeyboardInterrupt:

@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from ake import drive, frames_from_recording
 from ake_core import Observation
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, draw_completed, stable
-from windowing import WindowIdentity, click, _api
+from windowing import MouseExecutor, WindowIdentity, click, _api
 
 EMPTY = Observation((0,0,0,0,0),(6,6,6,6,10),1)
 FIVE = Observation((5,0,0,0,0),(6,6,6,6,9),1)
@@ -89,6 +89,68 @@ class SafetyTests(unittest.TestCase):
             self.assertFalse(click(binding,[10,10,10,10],lambda:True))
         api.SendInput.assert_not_called()
 
+    def test_mouse_backends_never_replay_a_partial_or_ambiguous_submission(self):
+        binding = WindowIdentity(1,10,20,'game.exe',(-300,100,100,100),96)
+        roi = [10,20,10,10]
+        for backend,count,error in [('auto',3,0),('auto',0,50),('auto',0,120),
+                                    ('auto',0,0),('auto',0,5),('auto',1,0),('auto',2,0),
+                                    ('sendinput',0,50),('window-message',None,0)]:
+            with self.subTest(backend=backend,count=count,error=error):
+                api,report = Mock(),Mock()
+                api.GetSystemMetrics.side_effect = {76:-512,77:0,78:2048,79:1080}.__getitem__
+                api.GetForegroundWindow.return_value = 1
+                api.WindowFromPoint.return_value = 2
+                api.IsChild.return_value = True
+                def identify(hwnd,pid):
+                    pid._obj.value = 10
+                    return 42
+                api.GetWindowThreadProcessId.side_effect = identify
+                def transform(hwnd,point):
+                    self.assertEqual((hwnd,point._obj.x,point._obj.y),(2,-285,125))
+                    point._obj.x,point._obj.y = 5,4
+                    return True
+                api.ScreenToClient.side_effect = transform
+                def bounds(hwnd,rect):
+                    rect._obj.right,rect._obj.bottom = 30,25
+                    return True
+                api.GetClientRect.side_effect = bounds
+                api.PostMessageW.return_value = True
+                def send(n,items,size):
+                    if n == 1:
+                        self.assertEqual(items._obj.mouse.flags,4)
+                        return 1
+                    self.assertEqual(size,40 if ctypes.sizeof(ctypes.c_void_p)==8 else 28)
+                    self.assertEqual((items[0].mouse.dx*2048//65536-512,items[0].mouse.dy*1080//65536),
+                                     (-285,125))
+                    ctypes.set_last_error(error)
+                    return count
+                api.SendInput.side_effect = send
+                with patch('windowing._api',return_value=(api,None)), patch('windowing.snapshot',return_value=binding):
+                    execute = MouseExecutor(binding,backend=backend,on_backend=report)
+                    posted = backend=='window-message' or backend=='auto' and count==0 and error in (50,120)
+                    if count==3 or posted:
+                        self.assertTrue(execute(roi,lambda: True))
+                    else:
+                        with self.assertRaises(RuntimeError): execute(roi,lambda: True)
+                    self.assertEqual(api.SendInput.call_count,0 if backend=='window-message' else 1+int(count==2))
+                    calls = [call.args for call in api.PostMessageW.call_args_list]
+                    self.assertEqual(calls,[(2,0x0201,1,4<<16|5),(2,0x0202,0,4<<16|5)] if posted else [])
+                    self.assertEqual(report.call_args.args[0],'window-message' if posted else 'sendinput')
+
+    def test_window_message_releases_only_the_original_recipient_after_cancellation(self):
+        binding = WindowIdentity(1,10,20,'game.exe',(0,0,100,100),96)
+        for after,owned,up_ok in [(None,True,True),((3,2,2),True,True),(None,False,True),((2,4,5),True,False)]:
+            with self.subTest(after=after,owned=owned,up_ok=up_ok), patch('windowing._api') as windows:
+                api = Mock()
+                windows.return_value = api,None
+                api.PostMessageW.side_effect = [True,up_ok]
+                execute = MouseExecutor(binding,backend='window-message')
+                with patch.object(execute,'_target',side_effect=[(2,4,5),after]), patch.object(execute,'_owns',return_value=owned):
+                    with self.assertRaises(RuntimeError): execute((0,0,4,4),lambda:True)
+                self.assertEqual([c.args[:2] for c in api.PostMessageW.call_args_list],
+                                 [(2,0x0201)]+([(2,0x0202)] if owned else []))
+                api.SendInput.assert_not_called()
+
     def run_stream(self, observations, mode='live', stop_after_click=False,
                    stop_at_submission=False, step=.12, save=None, pause_at=None,
                    sent_times=None, stop_after_confirmation=False, resume_at=None,
@@ -103,7 +165,7 @@ class SafetyTests(unittest.TestCase):
         def frames():
             for i,obs in enumerate(observations):
                 now[0] = stamps[i] if stamps is not None else i*step
-                yield i,now[0],obs,True
+                yield i,now[0],obs,obs is not None
         started = [False]
         stopped = [False]
         def keys():
@@ -149,7 +211,7 @@ class SafetyTests(unittest.TestCase):
             with self.subTest(error=type(error).__name__):
                 events = []
                 def frames():
-                    for i in range(3): yield i,i*.125,None,True
+                    for i in range(3): yield i,i*.125,object(),True
                     raise error
                 with patch('ake.time.monotonic',return_value=.25),self.assertRaises(type(error)):
                     drive(Profile(),frames(),mode='dry-run',emit=events.append)
@@ -159,13 +221,39 @@ class SafetyTests(unittest.TestCase):
                 self.assertEqual(summaries[0]['attempts_confirmed'],1)
                 self.assertEqual(summaries[0]['draw_clicks_sent'],0)
 
+    def test_missing_capture_never_completes_a_hand_or_extends_a_pending_click(self):
+        hand = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        samples = [hand,hand,None,hand,hand,hand,None]
+        stamps = [0,.125,.25,.375,.5,.625,10.625]
+        now, events, clicks = [0.0],[],[]
+        profile = Mock(regions={'draw':[0,0,20,20]})
+        profile.read.side_effect = lambda image:(image,{})
+        keys = iter([[0x77]])
+        def frames():
+            for i,(image,stamp) in enumerate(zip(samples,stamps)):
+                now[0] = stamp
+                yield i,stamp,image,True
+        save = Mock()
+        def send(region, permitted):
+            if not permitted(): return False
+            clicks.append(now[0])
+            return True
+        with patch('ake.time.monotonic',side_effect=lambda:now[0]):
+            result = drive(profile,frames(),mode='live',emit=events.append,keys=lambda:next(keys,[]),
+                           perform=send,save=save)
+        self.assertEqual(clicks,[.625])
+        self.assertEqual(result['pending_action'],{'id':1,'action':'draw'})
+        self.assertEqual(result['cards_confirmed'],0)
+        self.assertEqual(profile.read.call_count,5)
+        save.assert_called_once_with(hand,'action confirmation timed out (last available frame)')
+
     def test_capture_failure_preserves_unconfirmed_action_in_summary(self):
         obs = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','enabled',None))
         class Profile:
             regions = {'draw':[0,0,1,1]}
             def read(self,image): return obs,{}
         def frames():
-            for i in range(3): yield i,i*.125,None,True
+            for i in range(3): yield i,i*.125,object(),True
             raise OSError('capture failed')
         events = []
         keys = Mock(side_effect=[[0x77],[],[],[],[]])
@@ -303,6 +391,44 @@ class SafetyTests(unittest.TestCase):
                          ['F8','observation or action readiness timed out'])
         self.assertEqual(saved_at,[30])
         save.assert_called_once()
+
+    def test_stable_unexpected_page_requires_f8_even_when_pending_draw_later_matches(self):
+        empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
+        five = Observation(FIVE.slots,FIVE.inventory,1,buttons=('enabled','enabled',None))
+        dialog = Observation((None,)*5,(None,)*5,None,page='abandon_dialog',buttons=(None,None,'enabled'))
+        round_two = Observation((5,5,5,5,0),(6,6,6,6,6),2)
+        for wrong in (dialog,round_two):
+            for count in (2,4):
+                with self.subTest(page=wrong.page,frames=count):
+                    saved, clicks_at = Mock(),[]
+                    stream = [empty]*3+[wrong]*count+[five]*8
+                    events,_,summary = self.run_stream(stream,step=.125,save=saved,sent_times=clicks_at,
+                                                      resume_at=1.5 if count==4 else None)
+                    pauses = [e for e in events if e['event']=='paused']
+                    self.assertEqual(len(pauses),int(count==4))
+                    self.assertEqual(saved.call_count,int(count==4))
+                    self.assertEqual(len(clicks_at),2)
+                    if count == 4:
+                        self.assertGreaterEqual(clicks_at[1],1.75)
+                    self.assertEqual(summary['cards_confirmed'],1)
+
+    def test_paused_fourth_five_can_resume_verification_with_or_without_pending_draw(self):
+        candidate = Observation((5,5,5,5,0),(6,6,6,6,7),1)
+        prefix = [Observation(tuple([5]*k+[0]*(5-k)),(6,6,6,6,10-k),1,
+                              buttons=('enabled','enabled',None)) for k in range(4) for _ in range(3)]
+        for hand in ([],prefix):
+            for lose_focus in (False,True):
+                with self.subTest(pending=bool(hand),focus_lost=lose_focus):
+                    start = len(hand)*.125
+                    frames = hand+[candidate]*8+([None]*8 if lose_focus else [candidate]*8)+[candidate]*100
+                    saved_at = []
+                    events,clicks,summary = self.run_stream(frames,step=.125,
+                        pause_at=None if lose_focus else start+1,resume_at=start+2,
+                        save=lambda *_: saved_at.append(time.monotonic()))
+                    self.assertEqual(summary['termination_reason'],'suspected success; confirmation timeout')
+                    self.assertEqual(saved_at,[start+11])
+                    self.assertEqual(len(clicks),4 if hand else 0)
+                    self.assertEqual(bool(summary['pending_action']),bool(hand))
 
     def test_confirmed_draw_refreshes_readiness_deadline_for_disabled_button(self):
         empty = Observation(EMPTY.slots,EMPTY.inventory,1,buttons=('enabled','disabled',None))
@@ -525,7 +651,8 @@ class SafetyTests(unittest.TestCase):
         candidate = Observation((5,5,5,5,0),(6,6,6,6,7),1)
         t.observe(candidate)
         self.assertFalse(t.terminated)
-        self.assertFalse(t.resume())
+        t.pause()
+        self.assertTrue(t.resume())
         with self.assertRaises(RuntimeError):
             t.send(Action.DRAW, EMPTY, lambda _: True)
         t.observe(Observation((5,5,5,5,0),(6,6,6,6,6),1))
