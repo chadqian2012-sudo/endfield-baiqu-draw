@@ -16,6 +16,7 @@ from safety import Action, ActionTracker, Frame, ObservationStabilizer, initial,
 from timing import Timings
 
 VERSION = '0.2.0'
+REJECTION_CASES = {'unknown_page','unknown_slot','unknown_inventory'}
 
 def fingerprint(profile):
     digest = hashlib.sha256(profile.path.read_bytes())
@@ -99,6 +100,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
     def pause(reason):
         nonlocal cycle_clean,paused_started
         tracker.pause()
+        stabilizer.pause(now[0])
         cycle_clean = False
         if paused_started is None and active_started is not None:
             paused_started = now[0]
@@ -118,7 +120,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                     if paused_started is not None:
                         pause_total += now[0]-paused_started
                         paused_started = None
-                    stabilizer.frames.clear()
+                    stabilizer.resume(now[0])
                     emit({'event':'resumed'})
                 else:
                     emit({'event':'paused','reason':'pending action or success candidate requires reconciliation'})
@@ -140,18 +142,14 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
         if tracker.terminated: break
         if not focused:
             stabilizer.frames.clear()
+            if mode == 'live': stabilizer.pause(stamp)
             if mode == 'live' and not tracker.paused:
                 pause('focus lost; F8 required after reconciliation')
             continue
         obs,quality = profile.read(image)
         stable_obs = stabilizer.add(Frame(sequence,stamp,obs),stamp if mode == 'replay' else time.monotonic())
-        tracker.candidate = stabilizer.candidate
-        if stable_obs is None:
-            if mode == 'live' and tracker.check_timeout():
-                pause(tracker.error)
-                if save: save(image,tracker.error)
-            continue
-        decision = decide(obs,timings.early_restart)
+        tracker.candidate = stabilizer.candidate_since is not None
+        decision = decide(stable_obs,timings.early_restart) if stable_obs is not None else Decision.WAIT
         if decision == Decision.SUCCESS:
             if tracker.pending and tracker.pending[1] == Action.DRAW and draw_completed(tracker.pending[2],obs):
                 tracker.reconcile(obs)
@@ -162,14 +160,20 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             path = save(image,'success') if save else None
             emit({'event':'success','observation':asdict(obs),'evidence':path})
             break
+        if mode == 'live' and stabilizer.candidate_timed_out(stamp,tracker.timeout):
+            reason = 'suspected success; confirmation timeout'
+            pause(reason)
+            if save: save(image,reason)
+            break
+        if stable_obs is None:
+            if mode == 'live' and not tracker.candidate and tracker.check_timeout():
+                pause(tracker.error)
+                if save: save(image,tracker.error)
+            continue
         if tracker.candidate:
             if last_output != 'candidate':
                 emit({'event':'suspected_success','reason':'input frozen; awaiting consistent inventory'})
                 last_output = 'candidate'
-            if mode == 'live' and tracker.check_timeout():
-                if save: save(image,'suspected success; confirmation timeout')
-                reason = 'suspected success; confirmation timeout'
-                break
             continue
         if not entered:
             if initial(obs):
@@ -178,18 +182,18 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                 active_started = stamp
                 if mode == 'live' and tracker.paused: paused_started = stamp
                 new_attempt()
-            elif valid_observation(obs):
-                if last_output != 'takeover':
-                    emit({'event':'takeover_refused','reason':'nonempty initial hand; return manually to empty round 1'})
-                    last_output = 'takeover'
-                if mode == 'live': tracker.pause()
-                continue
         if mode != 'live':
             semantic = (obs,decision,entered)
             if semantic != last_output:
                 emit({'event':'observation' if mode == 'observe' else 'recommendation',
                       'observation':asdict(obs),'decision':decision.value if entered else 'wait','quality':quality})
                 last_output = semantic
+            continue
+        if not entered and valid_observation(obs):
+            if last_output != 'takeover':
+                emit({'event':'takeover_refused','reason':'nonempty initial hand; return manually to empty round 1'})
+                last_output = 'takeover'
+            tracker.pause()
             continue
         if tracker.pending:
             _,action,_ = tracker.pending
@@ -239,6 +243,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             return perform(profile.regions[button],permitted)
         action_id = tracker.send(action,context,submit,early_restart=timings.early_restart)
         if action_id is None:
+            if tracker.terminated: break
             pause('input cancelled: stop, pause, stale observation or focus change')
             continue
         if action == Action.DRAW: counters['draw_clicks_sent'] += 1
@@ -257,6 +262,7 @@ def validate(profile, dataset):
     errors = []
     history = []
     total = 0
+    rejection_cases = set()
     training = set(profile.config.get('training_batches',[]))
     if not training: errors.append('profile must name training_batches')
     with dataset.open(encoding='utf-8-sig') as f:
@@ -290,7 +296,10 @@ def validate(profile, dataset):
             obs = Observation(tuple(expected['slots']),tuple(expected['inventory']),expected['game_round'],
                               page=expected['page'],buttons=tuple(expected['buttons']))
             history.append((row.get('batch'),obs))
+            if obs.page == 'unknown': rejection_cases.add('unknown_page')
             if obs.page == 'hand':
+                if None in obs.slots: rejection_cases.add('unknown_slot')
+                if None in obs.inventory: rejection_cases.add('unknown_inventory')
                 coverage['cards'].update('empty' if v == 0 else str(v) for v in obs.slots if v is not None)
                 coverage['stock'].update(''.join(str(v) for v in obs.inventory if v is not None))
                 if obs.game_round is not None: coverage['round'].add(str(obs.game_round))
@@ -305,9 +314,12 @@ def validate(profile, dataset):
         if missing: errors.append(name+': validation missing '+','.join(sorted(missing)))
     if not early_reset: errors.append('no labelled early-abandon/dialog/full-reset sequence')
     if not single_draw: errors.append('no labelled single-draw transition')
+    for case in sorted(REJECTION_CASES-rejection_cases):
+        errors.append('validation missing rejection case: '+case)
     errors.extend(profile.issues())
     return {'passed':not errors,'profile_sha256':fingerprint(profile),'frames':total,'errors':errors,
-            'coverage':{name:sorted(values) for name,values in coverage.items()},'class_results':results}
+            'coverage':{name:sorted(values) for name,values in coverage.items()},'class_results':results,
+            'rejection_cases':sorted(rejection_cases)}
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
@@ -439,8 +451,10 @@ def main(argv=None):
             problems.append('independent validation report required')
         else:
             report = json.loads(args.qualification.read_text(encoding='utf-8-sig'))
-            if not report.get('passed') or report.get('profile_sha256') != fingerprint(profile):
+            if report.get('passed') is not True or report.get('profile_sha256') != fingerprint(profile):
                 problems.append('validation failed or profile/templates changed')
+            if not REJECTION_CASES.issubset(report.get('rejection_cases',[])):
+                problems.append('validation report lacks rejection cases; rerun validate')
         if problems:
             dump({'event':'live_blocked','reasons':problems})
             return 2

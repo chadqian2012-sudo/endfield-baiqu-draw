@@ -42,12 +42,28 @@ class ObservationStabilizer:
     """Maintains only three independent captures, with an immediate success freeze."""
     def __init__(self):
         self.frames = deque(maxlen=3)
-        self.candidate = False
+        self.candidate_since = None
+        self.paused_at = None
+
+    def pause(self, now):
+        if self.paused_at is None:
+            self.paused_at = now
+
+    def resume(self, now):
+        if self.paused_at is not None:
+            if self.candidate_since is not None:
+                self.candidate_since += now-max(self.candidate_since,self.paused_at)
+            self.paused_at = None
+        self.frames.clear()
+
+    def candidate_timed_out(self, now, timeout):
+        until = self.paused_at if self.paused_at is not None else now
+        return self.candidate_since is not None and until-self.candidate_since >= timeout
 
     def add(self, frame, now):
         obs = frame.observation
-        if len(obs.slots) == 5 and obs.slots.count(5) >= 4:
-            self.candidate = True
+        if self.candidate_since is None and len(obs.slots) == 5 and obs.slots.count(5) >= 4:
+            self.candidate_since = frame.timestamp
         if self.frames and (frame.sequence <= self.frames[-1].sequence or frame.timestamp <= self.frames[-1].timestamp):
             self.frames.clear()
             return None
