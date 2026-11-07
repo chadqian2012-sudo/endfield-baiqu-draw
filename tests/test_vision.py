@@ -202,6 +202,43 @@ class VisionTests(unittest.TestCase):
                 if source: recheck.assert_called_once_with(profile,report.parent/source)
                 else: recheck.assert_not_called()
 
+    def test_desktop_rebind_requires_same_game_size_and_dpi(self):
+        game = WindowIdentity(1,2,3,'Endfield.exe',(0,0,80,60),144)
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            layout, bound = root/'original.json',root/'logs'/'bound.json'
+            bound.parent.mkdir()
+            write_image(root/'sample.png',np.arange(64,dtype=np.uint8).reshape(8,8))
+            original = json.dumps({'frame_size':[80,60],'window':asdict(game),
+                                   'groups':{'cards':{'templates':{'5':['sample.png']}}}})
+            layout.write_text(original,encoding='utf-8')
+            args = ['calibrate','--rebind','--layout',str(layout),'--output',str(bound)]
+            for mismatch in (replace(game,process_path='other.exe'),replace(game,dpi=96),
+                             replace(game,client=(0,0,40,60))):
+                with self.subTest(window=mismatch), patch('windowing.find_unique',return_value=mismatch):
+                    with self.assertRaises(ValueError): main(args)
+                    self.assertFalse(bound.exists())
+            relaunched = replace(game,hwnd=4,pid=5,process_started=6,client=(7,8,80,60))
+            with patch('windowing.find_unique',return_value=relaunched):
+                self.assertEqual(main(args,output=lambda event: None),0)
+            rebound = VisionProfile(bound)
+            self.assertEqual(rebound.config['window'],json.loads(json.dumps(asdict(relaunched))))
+            template = rebound.config['groups']['cards']['templates']['5'][0]
+            self.assertFalse(Path(template).is_absolute())
+            self.assertEqual(layout.read_text(encoding='utf-8'),original)
+
+    def test_desktop_cancel_during_dataset_recheck_never_reaches_game(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            layout, dataset = root/'profile.json',root/'independent.jsonl'
+            layout.write_text('{"frame_size":[80,60]}',encoding='utf-8')
+            dataset.write_text('{}\n',encoding='utf-8')
+            with patch('windowing.find_unique') as find, patch('windowing.Hotkeys') as keys:
+                with self.assertRaises(InterruptedError):
+                    main(['run','--live','--profile',str(layout),'--dataset',str(dataset)],stopped=lambda: True)
+                find.assert_not_called()
+                keys.assert_not_called()
+
     def test_live_preserves_success_when_evidence_or_notification_fails(self):
         binding = WindowIdentity(1,2,3,'fixture.exe',(0,0,8,8),96)
         success = Observation((5,5,5,5,0),(6,6,6,6,6),1)
