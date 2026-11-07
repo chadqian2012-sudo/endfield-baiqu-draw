@@ -1,8 +1,14 @@
 # 百趣演武：四张 5 自动抽牌脚本
 
-> **0.2.0 首个集成候选版本：程序入口已接通，实机自动抽牌尚未验收。** 当前本地素材不完整，自动模式会拒绝启动。不要把命令存在或 EXE 能启动理解为实机通过。验证状态见 [PROGRESS.md](PROGRESS.md)。
+**Windows 用户双击 `AKE.exe` 即可打开中文抽牌助手。** 第一次使用需要适合当前游戏画面的识别资料。公开 EXE 不包含玩家的本地模板和录像。
 
-## 安装与运行
+1. 把 EXE 放在可以写入的文件夹，打开游戏的百趣演武第一轮空牌面，再双击 EXE。
+2. 如果窗口提示缺资料，可在窗口选择已有的识别配置和独立验收素材。手头没有素材时，点「录制素材」并切回游戏，手动演示一次抽牌和放弃重开。每步等画面稳定。录像还需标注并核验；录完后可从窗口看到保存位置。
+3. 设置完成后，以后双击就会自动检查资料。看到「可以开始抽牌」，切回游戏按 **F8**。再按 F8 暂停或恢复，F9 结束。确认同一手已有四张 5 时会停手并保存证据。
+
+程序会记住选择的文件。若游戏重启后提示窗口已变化，可点「重新绑定游戏」再开始。游戏程序、窗口大小和显示缩放须与原设置一致。请保留 EXE 旁的配置、裁剪图和 `logs` 文件夹。当前这套实机素材仍待补齐，实机进展见 [PROGRESS.md](PROGRESS.md)。
+
+## 从源码或命令行运行
 
 Windows 64 位、Python 3.12。解压源码后在项目目录运行：
 
@@ -13,7 +19,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe ake.py math
 ```
 
-EXE 使用相同命令，例如 `AKE.exe math`。它是命令行程序，双击后窗口可能立即关闭，应从 PowerShell 运行。源码和 EXE 使用同一视觉、策略和控制器。
+不带参数时源码和 EXE 都打开桌面窗口。原有命令行用法继续可用，例如 `AKE.exe math`。
 
 窗口 API 入口会为当前线程建立 Per-Monitor V2 DPI 上下文，让窗口几何、MSS 截图及鼠标坐标计算使用一致的坐标空间；系统不支持或设置失败时明确报错并停止。该线程上下文贯穿窗口操作流程。[微软线程 DPI API 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddpiawarenesscontext)
 
@@ -90,7 +96,7 @@ F8 启动或恢复后，持续未知、无法取得三帧稳定观察或下一�
 ```powershell
 python -m pip install pyinstaller==6.11.1 pyinstaller-hooks-contrib==2026.9
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $PWD 'captures\pyinstaller-cache'
-python -m PyInstaller --clean --noconfirm --onefile --name AKE --specpath captures --workpath captures\pyinstaller-build --distpath dist ake.py
+python -m PyInstaller --clean --noconfirm --onefile --console --hide-console hide-early --name AKE --specpath captures --workpath captures\pyinstaller-build --distpath dist ake.py
 ```
 
 2026-11-07 已从日志与动作期限修复后的源码构建本地 Windows x64 EXE 候选。60 项源码检查和 13 项 EXE 命令检查全部通过。检查包括命令行、错误退出、中文路径采样和合成录像回放。构建结果与校验值见 [PROGRESS.md](PROGRESS.md)。实机识别、点击和成功停止仍待验收。

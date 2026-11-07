@@ -1,4 +1,4 @@
-"""Windows CLI for calibrated observation, replay and qualified automation."""
+"""Windows draw assistant. Open without arguments for the desktop launcher."""
 import argparse
 import csv
 from contextlib import ExitStack
@@ -7,6 +7,7 @@ from datetime import datetime
 import hashlib
 import json
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
@@ -17,7 +18,7 @@ from math_verify import threshold, totals
 from safety import Action, ActionTracker, Frame, ObservationStabilizer, initial, draw_completed
 from timing import Timings
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 REJECTION_CASES = {'unknown_page','unknown_slot','unknown_inventory'}
 
 def fingerprint(profile):
@@ -294,7 +295,7 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             emit(result)
     return result
 
-def validate(profile, dataset):
+def validate(profile, dataset, *, stopped=None):
     """Evaluate independently labelled batches and observed single-draw/early-reset paths."""
     from vision import read_image
     import cv2
@@ -310,6 +311,10 @@ def validate(profile, dataset):
     training = set(profile.config.get('training_batches',[]))
     if not training: errors.append('profile must name training_batches')
 
+    def check_stop():
+        if stopped and stopped():
+            raise InterruptedError('已停止核对素材。')
+
     def compatible(obs, hands):
         return obs.page == 'unknown' or (obs.page == 'hand' and obs.game_round in (None,1)
                 and all(value is None or any(value == hand.slots[i] for hand in hands)
@@ -319,6 +324,7 @@ def validate(profile, dataset):
 
     with dataset.open(encoding='utf-8-sig') as f, ExitStack() as cleanup:
         for line_number,line in enumerate(f,1):
+            check_stop()
             row = json.loads(line)
             if ('image' in row) == ('recording' in row):
                 raise ValueError('validation row requires exactly one image or recording source')
@@ -342,6 +348,7 @@ def validate(profile, dataset):
                     cleanup.callback(recordings[recording][0].close)
                 frames,trace = recordings[recording]
                 for frame in frames:
+                    check_stop()
                     trace.append(profile.read(frame[2])[0])
                     if frame[0] >= sequence: break
                 else:
@@ -386,7 +393,7 @@ def validate(profile, dataset):
             for i,name in enumerate(('draw','abandon','confirm')):
                 if obs.buttons[i] is not None: coverage[name].add(obs.buttons[i])
         for frames,_ in recordings.values():
-            for _ in frames: pass
+            for _ in frames: check_stop()
     early_reset = any(ra is not None and ra == rb == rc and sa < sb < sc and ba == bb == bc
                       and valid_observation(a) and 0 < sum(v != 0 for v in a.slots) < 5
                       and a.buttons[1] == 'enabled' and b.page == 'abandon_dialog'
@@ -411,7 +418,12 @@ def validate(profile, dataset):
             'coverage':{name:sorted(values) for name,values in coverage.items()},'class_results':results,
             'rejection_cases':sorted(rejection_cases),'dataset':str(dataset.resolve())}
 
-def main(argv=None):
+def main(argv=None, *, output=None, stopped=None):
+    if argv is None: argv = sys.argv[1:]
+    if not argv:
+        from desktop import launch
+        return launch(main)
+    publish = output or dump
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--version',action='version',version=VERSION)
     commands = p.add_subparsers(dest='command',required=True)
@@ -423,6 +435,7 @@ def main(argv=None):
     a.add_argument('--early-restart',action='store_true')
     c = commands.add_parser('calibrate')
     c.add_argument('--layout',type=Path)
+    c.add_argument('--rebind',action='store_true',help='bind an existing layout to the same game, size and DPI')
     c.add_argument('--output',type=Path,default=Path('calibration.local.json'))
     c = commands.add_parser('sample')
     c.add_argument('--profile',type=Path,required=True)
@@ -450,30 +463,34 @@ def main(argv=None):
             group = c.add_mutually_exclusive_group()
             group.add_argument('--dry-run',action='store_true')
             group.add_argument('--live',action='store_true')
-            c.add_argument('--qualification',type=Path)
+            sources = c.add_mutually_exclusive_group()
+            sources.add_argument('--qualification',type=Path)
+            sources.add_argument('--dataset',type=Path,help='verify the independently labelled source directly')
     args = p.parse_args(argv)
     if args.command == 'math':
         for name,early in [('baseline',False),('early_restart',True)]:
             probability,draws,total_draws,restarts = totals(early)
-            dump({'strategy':name,'probability':str(probability),'draws_per_attempt':float(draws),
+            publish({'strategy':name,'probability':str(probability),'draws_per_attempt':float(draws),
                   'expected_draws':float(total_draws),'expected_restarts':float(restarts)})
-        dump({'threshold':str(threshold()),'model':'uniform without replacement; independent identical resets'})
+        publish({'threshold':str(threshold()),'model':'uniform without replacement; independent identical resets'})
         return 0
     if args.command == 'analyze':
         obs = Observation(tuple(args.slots),tuple(args.inventory),args.round)
         decision = decide(obs,args.early_restart)
-        output = {'decision':decision.value,'source':'manual input; no game state verified'}
+        analysis = {'decision':decision.value,'source':'manual input; no game state verified'}
         if decision != Decision.WAIT:
-            output['continue_without_voluntary_restart_probability'] = str(chance(obs.slots.count(5),sum(v not in (0,5) for v in obs.slots)))
-        dump(output)
+            analysis['continue_without_voluntary_restart_probability'] = str(chance(obs.slots.count(5),sum(v not in (0,5) for v in obs.slots)))
+        publish(analysis)
         return 0
     from vision import VisionProfile
     if args.command == 'calibrate':
         from windowing import find_unique
+        if args.rebind and not args.layout:
+            p.error('--rebind requires --layout')
         binding = find_unique()
         if args.layout is None:
             import cv2
-            dump({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
+            publish({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
             frame = next((image for _,_,image,focused in frames_from_window(binding,10) if focused),None)
             if frame is None: raise ValueError('foreground game capture timed out')
             config = {'frame_size':list(binding.client[2:]),'regions':{},'groups':{},'anchors':{},'training_batches':[]}
@@ -495,19 +512,30 @@ def main(argv=None):
             config['window'] = asdict(binding)
             VisionProfile.check_regions(config['frame_size'],config['regions'])
             VisionProfile.save_config(args.output,config)
-            dump({'calibration':str(args.output),'issues':VisionProfile(args.output).issues()})
+            publish({'calibration':str(args.output),'issues':VisionProfile(args.output).issues()})
             return 0
         profile = VisionProfile(args.layout)
         if profile.size != binding.client[2:]: raise ValueError('layout size does not match game client')
         config = profile.config
+        if args.rebind:
+            previous = config.get('window') or {}
+            if (os.path.normcase(previous.get('process_path','')) != os.path.normcase(binding.process_path)
+                    or previous.get('dpi') != binding.dpi):
+                raise ValueError('游戏路径或显示缩放和原设置不同，请重新校准。')
+        destination = args.output.resolve().parent
+        def template_path(path):
+            target = (profile.path.parent/path).resolve()
+            if target.drive.lower() != destination.drive.lower():
+                return str(target)
+            return os.path.relpath(target,destination)
         for group in config.get('groups',{}).values():
             for label,paths in group.get('templates',{}).items():
-                group['templates'][label] = [str((profile.path.parent/path).resolve()) for path in paths]
+                group['templates'][label] = [template_path(path) for path in paths]
         for anchor in config.get('anchors',{}).values():
-            anchor['template'] = str((profile.path.parent/anchor['template']).resolve())
+            anchor['template'] = template_path(anchor['template'])
         config['window'] = asdict(binding)
         VisionProfile.save_config(args.output,config)
-        dump({'calibration':str(args.output),'issues':profile.issues()})
+        publish({'calibration':str(args.output),'issues':profile.issues()})
         return 0
     profile = VisionProfile(args.profile)
     if args.command == 'sample':
@@ -528,33 +556,33 @@ def main(argv=None):
             binding = find_unique()
             if json.loads(json.dumps(asdict(binding))) != profile.config.get('window'):
                 raise ValueError('sample requires calibrated window')
-            dump({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
+            publish({'event':'awaiting_foreground','message':'switch to game within 10 seconds'})
             image = next((image for _,_,image,focused in frames_from_window(binding,10) if focused),None)
             if image is None: raise ValueError('foreground game capture timed out')
         profile.add_sample(image,args.group,args.label,args.index,args.digit,args.score,args.margin,args.batch)
-        dump({'sample_saved':True,'issues':VisionProfile(args.profile).issues()})
+        publish({'sample_saved':True,'issues':VisionProfile(args.profile).issues()})
         return 0
     if args.command == 'validate':
         report = validate(profile,args.dataset)
         args.output.parent.mkdir(parents=True,exist_ok=True)
         args.output.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
-        dump(report)
+        publish(report)
         return 0 if report['passed'] else 2
     live = args.command == 'run' and args.live
     if live:
-        problems = profile.issues()
-        if args.qualification is None:
-            problems.append('independent validation report required')
-        else:
+        source = args.dataset
+        if args.qualification is not None:
             report = json.loads(args.qualification.read_text(encoding='utf-8-sig'))
-            if not report.get('dataset'):
-                problems.append('validation report lacks source dataset; rerun validate')
-            else:
-                source = Path(report['dataset'])
-                if not source.is_absolute(): source = args.qualification.parent/source
-                problems = validate(profile,source)['errors']
+            if report.get('dataset'): source = args.qualification.parent/report['dataset']
+        if source is None:
+            reason = ('independent validation report required' if args.qualification is None else
+                      'validation report lacks source dataset; rerun validate')
+            problems = profile.issues() + [reason]
+        else:
+            options = {'stopped':stopped} if stopped else {}
+            problems = validate(profile,source,**options)['errors']
         if problems:
-            dump({'event':'live_blocked','reasons':problems})
+            publish({'event':'live_blocked','reasons':problems})
             return 2
     keys = handler = last_image = None
     try:
@@ -562,13 +590,14 @@ def main(argv=None):
         handler = StrictLog('logs/events.jsonl',maxBytes=2_000_000,backupCount=3,encoding='utf-8')
         def emit(event):
             event = {'time':datetime.now().astimezone().isoformat(),'monotonic':time.monotonic(),**event}
-            dump(event)
+            publish(event)
             handler.emit(logging.LogRecord('ake',logging.INFO,'',0,json.dumps(event,ensure_ascii=False),(),None))
         if args.command == 'replay':
             frames = frames_from_recording(args.recording)
             mode,perform = 'replay',None
         else:
             from windowing import find_unique, Hotkeys, click
+            if stopped and stopped(): return 0
             binding = find_unique()
             expected = profile.config.get('window')
             if not expected or json.loads(json.dumps(asdict(binding))) != expected:
@@ -582,16 +611,18 @@ def main(argv=None):
             for frame in frames:
                 if frame[2] is not None: last_image = frame[2]
                 yield frame
-        result = drive(profile,remember(),mode=mode,emit=emit,keys=keys.poll if keys else None,
+        def poll_keys():
+            return [0x78] if stopped and stopped() else keys.poll()
+        result = drive(profile,remember(),mode=mode,emit=emit,keys=poll_keys if keys else None,
                         perform=perform,save=(lambda image,reason:evidence(profile,image,reason)) if live else None)
     except KeyboardInterrupt:
-        dump({'event':'stopped','reason':'Ctrl+C'})
+        publish({'event':'stopped','reason':'Ctrl+C'})
         return 0
     except Exception as error:
-        dump({'event':'error','reason':str(error)})
+        publish({'event':'error','reason':str(error)})
         if live and last_image is not None:
-            try: dump({'evidence':evidence(profile,last_image,str(error))})
-            except Exception as save_error: dump({'evidence_error':str(save_error)})
+            try: publish({'evidence':evidence(profile,last_image,str(error))})
+            except Exception as save_error: publish({'evidence_error':str(save_error)})
         return 1
     else:
         if live:

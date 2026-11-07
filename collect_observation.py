@@ -14,35 +14,33 @@ import mss
 import numpy as np
 from windowing import find_unique, snapshot, foreground_matches
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--seconds', type=int, default=120)
-    parser.add_argument('--fps', type=int, default=5)
-    args = parser.parse_args()
-    if not 1 <= args.seconds <= 300 or not 1 <= args.fps <= 10:
-        raise SystemExit('duration or FPS out of bounds')
+def record(seconds=120, fps=5, *, output_root='captures', on_start=None, stopped=None):
+    """Record from the first foreground frame. Return the directory and frame count."""
+    if not 1 <= seconds <= 300 or not 1 <= fps <= 10:
+        raise ValueError('duration or FPS out of bounds')
     binding = find_unique()
     left,top,width,height = binding.client
     if width < 100 or height < 100:
-        raise SystemExit('Invalid game window size')
+        raise ValueError('Invalid game window size')
     if width % 2 or height % 2:
-        raise SystemExit('Recording requires even client width and height; resize and recalibrate')
+        raise ValueError('Recording requires even client width and height; resize and recalibrate')
     region = {'left': left, 'top': top, 'width': width, 'height': height}
-    outdir = Path('captures') / datetime.now().strftime('%Y%m%d-%H%M%S')
+    outdir = Path(output_root) / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     outdir.mkdir(parents=True, exist_ok=False)
-    writer = cv2.VideoWriter(str(outdir / 'observation.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), args.fps, (width, height))
+    writer = cv2.VideoWriter(str(outdir / 'observation.mp4'), cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
     try:
         if not writer.isOpened():
-            raise SystemExit('Video writer unavailable')
-        start = time.monotonic()
+            raise ValueError('Video writer unavailable')
+        start = None
         frames = 0
         with (outdir / 'frames.csv').open('w', newline='', encoding='utf-8') as f, mss.mss() as capture:
             log = csv.writer(f)
             log.writerow(['frame', 'elapsed_seconds'])
-            print(f'READY {outdir} duration={args.seconds}s; input disabled', flush=True)
-            while time.monotonic() - start < args.seconds:
-                if (outdir / 'STOP').exists():
-                    print('Stop marker detected', flush=True)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if (stopped and stopped()) or (outdir / 'STOP').exists():
+                    if not frames:
+                        raise ValueError('录制已取消，没有录到游戏画面。')
                     break
                 tick = time.monotonic()
                 if snapshot(binding.hwnd) != binding:
@@ -51,11 +49,31 @@ def main():
                     frame = cv2.cvtColor(np.asarray(capture.grab(region)),cv2.COLOR_BGRA2BGR)
                     frame[int(height*.95):] = 0
                     writer.write(frame)
+                    if start is None:
+                        start = tick
+                        deadline = start + seconds
                     log.writerow([frames, f'{tick-start:.6f}'])
                     frames += 1
-                time.sleep(max(0, 1/args.fps - (time.monotonic()-tick)))
+                    if frames == 1 and on_start:
+                        on_start(outdir)
+                time.sleep(max(0, 1/fps - (time.monotonic()-tick)))
     finally:
         writer.release()
+    if not frames:
+        raise ValueError('等待游戏前台超时，没有录到画面。请打开抽牌页再录制。')
+    return outdir, frames
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--seconds', type=int, default=120)
+    parser.add_argument('--fps', type=int, default=5)
+    args = parser.parse_args()
+    print('Switch to the game within 30 seconds; input disabled', flush=True)
+    try:
+        outdir,frames = record(args.seconds,args.fps,on_start=lambda path: print(
+            f'READY {path} duration={args.seconds}s; input disabled', flush=True))
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     print(f'DONE {frames} frames {outdir}', flush=True)
 
 if __name__ == '__main__': main()
