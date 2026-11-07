@@ -148,8 +148,8 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
             emit({'event':'strategy','attempt':counters['attempts_confirmed'],'early_restart':timings.early_restart})
             last_policy = timings.early_restart
 
-    if mode == 'live': emit({'event':'armed','message':'F8 start/pause, F9 terminal stop'})
     try:
+        if mode == 'live': emit({'event':'armed','message':'F8 start/pause, F9 terminal stop'})
         for sequence,stamp,image,focused in frames:
             now[0] = stamp if mode == 'replay' else clock()
             handle_keys()
@@ -277,18 +277,21 @@ def drive(profile, frames, *, mode, emit, keys=None, perform=None, save=None):
                   'elapsed':None if active_started is None else finished_at-active_started,'paused_seconds':pause_total,
                   'last_observation':asdict(last_observation) if last_observation is not None else None,
                   'pending_action':{'id':tracker.pending[0],'action':tracker.pending[1].value} if tracker.pending else None}
-        if reason == 'success':
-            result['evidence'] = None
-            result['evidence_error'] = None
-            started = time.monotonic()
-            try:
-                if save: result['evidence'] = save(image,'success')
-            except (Exception,KeyboardInterrupt) as error:
-                result['evidence_error'] = 'Ctrl+C' if isinstance(error,KeyboardInterrupt) else str(error)
-                emit({'event':'evidence_error','reason':result['evidence_error']})
-            result['evidence_seconds'] = time.monotonic()-started if save else None
-            emit({'event':'success','observation':asdict(last_observation),'evidence':result['evidence']})
-        emit(result)
+        try:
+            if reason == 'success':
+                result['evidence'] = None
+                result['evidence_error'] = None
+                started = time.monotonic()
+                try:
+                    if save: result['evidence'] = save(image,'success')
+                except (Exception,KeyboardInterrupt) as error:
+                    result['evidence_error'] = 'Ctrl+C' if isinstance(error,KeyboardInterrupt) else str(error)
+                result['evidence_seconds'] = time.monotonic()-started if save else None
+                if result['evidence_error'] is not None:
+                    emit({'event':'evidence_error','reason':result['evidence_error']})
+                emit({'event':'success','observation':asdict(last_observation),'evidence':result['evidence']})
+        finally:
+            emit(result)
     return result
 
 def validate(profile, dataset):
@@ -559,8 +562,8 @@ def main(argv=None):
         handler = StrictLog('logs/events.jsonl',maxBytes=2_000_000,backupCount=3,encoding='utf-8')
         def emit(event):
             event = {'time':datetime.now().astimezone().isoformat(),'monotonic':time.monotonic(),**event}
-            handler.emit(logging.LogRecord('ake',logging.INFO,'',0,json.dumps(event,ensure_ascii=False),(),None))
             dump(event)
+            handler.emit(logging.LogRecord('ake',logging.INFO,'',0,json.dumps(event,ensure_ascii=False),(),None))
         if args.command == 'replay':
             frames = frames_from_recording(args.recording)
             mode,perform = 'replay',None

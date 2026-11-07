@@ -51,6 +51,8 @@ python ake.py run --live --profile calibration.local.json --qualification logs/q
 
 运行开始后，正常结束、Ctrl+C 和采集/识别异常都会输出一次 `summary`，包含终止原因、计数、时间、最后一次观察及 `pending_action`；未确认的发送不能当作已抽到的牌。异常仍返回失败退出码，不会因输出摘要而被当作成功。
 
+日志写入失败时，终端仍保留一次完整结果，并返回失败退出码。日志故障会在点击提交前停止执行；终端出现 `input_intent` 只表示准备点击，不能当作已发送。成功或证据错误通知的日志失败，也不会吞掉最终结果。
+
 确认成功后先停止输入，再保存证据。成功摘要包含 `evidence`、`evidence_seconds` 和 `evidence_error`；保存失败或被 Ctrl+C 中断时，保留 `termination_reason: "success"`，单独输出保存错误并返回失败退出码，继续尝试本地提醒。提醒耗时由 `notification.elapsed` 单列；提醒失败输出 `notification_error`，不会进入游戏画面的错误截图路径。保存和提醒耗时均不计入抽牌总耗时。
 
 校准、采样和验收准备阶段也使用统一的命令行退出边界：Ctrl+C 输出 `stopped` 并退出 0，普通错误输出 `error` 并退出 1；帮助及参数错误保留 argparse 的退出行为。
@@ -91,7 +93,7 @@ $env:PYINSTALLER_CONFIG_DIR = Join-Path $PWD 'captures\pyinstaller-cache'
 python -m PyInstaller --clean --noconfirm --onefile --name AKE --specpath captures --workpath captures\pyinstaller-build --distpath dist ake.py
 ```
 
-2026-11-02 已从动作期限修复后的源码重新构建本地 Windows x64 EXE 候选，59 项源码离线检查和 13 项 EXE 黑盒检查通过，涵盖命令行、错误退出、中文路径采样保存和合成录像回放。该候选已包含线程 DPI、动作确认期限、计时及配置保存修复；构建结果与校验值见 [PROGRESS.md](PROGRESS.md)。它尚未作为 GitHub Release 发布，也未通过真实游戏识别、点击或成功终止验收。
+2026-11-07 已从日志与动作期限修复后的源码构建本地 Windows x64 EXE 候选。60 项源码检查和 13 项 EXE 命令检查全部通过。检查包括命令行、错误退出、中文路径采样和合成录像回放。构建结果与校验值见 [PROGRESS.md](PROGRESS.md)。实机识别、点击和成功停止仍待验收。
 
 以下保留原始开发需求，作为实现和验收依据。
 

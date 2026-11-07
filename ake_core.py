@@ -32,8 +32,6 @@ def choose_early_restart(draw_costs, restart_costs) -> bool:
         return False
     d = sum(draw_costs) / len(draw_costs)
     r = sum(restart_costs) / len(restart_costs)
-    if d <= 0 or r < 0:
-        raise ValueError('invalid timing samples')
     return r / d < float(THRESHOLD)
 
 @dataclass(frozen=True)
